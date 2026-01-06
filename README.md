@@ -6,7 +6,8 @@ A CLI tool to manage isolated development environments using Incus system contai
 
 - **Isolated dev environments** - Each container is fully isolated with its own Docker daemon
 - **Non-root user** - Runs as `dev` user with matching UID, passwordless sudo available
-- **SSH access** - Unique port per container (starting at 2201)
+- **SSH access** - Unique port per container (starting at 2200, incrementing by 10)
+- **Service ports** - 10 additional forwarded ports per container for services (2300-2309, 2310-2319, etc.)
 - **Shared configs** - Automatically mounts `~/.config`, `~/.opencode`, `~/.ssh`, `~/.gitconfig`
 - **Docker-in-Docker** - Full Docker support via Incus nesting
 - **Low overhead** - ~100-200MB RAM per container vs 512MB+ for VMs
@@ -46,7 +47,7 @@ ln -sf "$(pwd)/bin/ocdev" ~/.local/bin/ocdev
 ```bash
 # Create a new dev environment
 ocdev create myproject
-# Output: Created ocdev-myproject, SSH: ssh -p 2201 dev@localhost
+# Output: Container 'myproject' created (SSH: 2200, Services: 2300-2309)
 
 # Create with a custom setup script
 ocdev create myproject --post-create ~/dotfiles/dev-setup.sh
@@ -58,7 +59,7 @@ ocdev list
 ocdev shell myproject
 
 # Access via SSH
-ssh -p 2201 dev@localhost
+ssh -p 2200 dev@localhost
 # Or get the command:
 ocdev ssh myproject
 
@@ -96,7 +97,9 @@ ocdev ports
 2. **Container**: Launches Ubuntu 25.10 system container with the profile
 3. **Mounts**: Binds host directories into `/home/dev/` inside container
 4. **Provisioning**: Installs Docker, SSH server, git, curl
-5. **Port Forwarding**: Maps unique host port to container's SSH (port 22)
+5. **Port Forwarding**: Maps host ports to container ports:
+   - SSH: host `22X0` -> container `22` (where X is 0, 1, 2, ... for each VM)
+   - Services: host `23X0-23X9` -> container `23X0-23X9` (10 ports per VM)
 
 ## Directory Structure
 
@@ -105,6 +108,48 @@ ocdev ports
 ~/.ocdev/                # Config directory
 ~/.ocdev/ports           # Port assignments (name:port format)
 ~/.ocdev/.lock           # Lock file for concurrent operations
+```
+
+## Port Allocation
+
+Each container gets 11 forwarded ports:
+- 1 SSH port (host -> container port 22)
+- 10 service ports (host -> same port in container)
+
+| VM # | SSH Port | Service Ports | Use For |
+|------|----------|---------------|---------|
+| 1    | 2200     | 2300-2309     | First container |
+| 2    | 2210     | 2310-2319     | Second container |
+| 3    | 2220     | 2320-2329     | Third container |
+| n    | 2200+(n-1)*10 | 2300+(n-1)*10 to 2309+(n-1)*10 | nth container |
+
+Service ports are forwarded to the same port inside the container. For example, if your app inside container 1 listens on port 2300, access it from host at `localhost:2300`.
+
+## Firewall Configuration (Recommended)
+
+By default, ocdev ports are bound to all interfaces (`0.0.0.0`). It is recommended to restrict access to a trusted network interface (e.g., Tailscale) using UFW.
+
+### Enable UFW (if not already enabled)
+
+```bash
+sudo ufw enable
+```
+
+### Allow on Tailscale only
+
+```bash
+# Allow SSH and service ports on Tailscale interface
+sudo ufw allow in on tailscale0 to any port 2200:2399 proto tcp
+
+# Block these ports on public interfaces (adjust interface names as needed)
+sudo ufw deny in on eth0 to any port 2200:2399 proto tcp
+sudo ufw deny in on wlan0 to any port 2200:2399 proto tcp
+```
+
+### Verify rules
+
+```bash
+sudo ufw status numbered
 ```
 
 ## Host Directory Mounts

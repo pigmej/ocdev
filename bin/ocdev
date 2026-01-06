@@ -8,7 +8,10 @@ readonly LOCK_FILE="${OCDEV_DIR}/.lock"
 readonly CONTAINER_PREFIX="ocdev-"
 readonly PROFILE_NAME="ocdev"
 readonly BASE_IMAGE="images:ubuntu/25.10"
-readonly SSH_PORT_START=2201
+readonly SSH_PORT_START=2200
+readonly SERVICE_PORT_START=2300
+readonly PORTS_PER_VM=10
+readonly SERVICE_PORTS_COUNT=10
 
 # Exit codes
 readonly EXIT_SUCCESS=0
@@ -121,18 +124,26 @@ validate_name() {
 #######################################
 
 # Allocate next available port (must be called within flock context)
+# Ports are allocated in increments of PORTS_PER_VM (10) to allow for service ports
 allocate_port() {
     local port=$SSH_PORT_START
     local max_port=65535
     
     while grep -Fq ":${port}" "$PORTS_FILE" 2>/dev/null; do
-        ((port++))
+        ((port += PORTS_PER_VM))
         if [[ $port -gt $max_port ]]; then
-            die "No available ports (all ports from $SSH_PORT_START to $max_port are allocated)"
+            die "No available ports (all ports from $SSH_PORT_START are allocated)"
         fi
     done
     
     echo "$port"
+}
+
+# Get the service port base for a given SSH port
+# SSH port 2200 -> service base 2300, SSH 2210 -> service base 2310, etc.
+get_service_port_base() {
+    local ssh_port="$1"
+    echo $((SERVICE_PORT_START + (ssh_port - SSH_PORT_START)))
 }
 
 remove_port() {
@@ -270,6 +281,18 @@ cmd_create() {
         connect=tcp:127.0.0.1:22 \
         bind=host
     
+    # Add service port proxy devices (10 ports for services inside container)
+    local service_base
+    service_base=$(get_service_port_base "$port")
+    info "Configuring service ports ${service_base}-$((service_base + SERVICE_PORTS_COUNT - 1))..."
+    for i in $(seq 0 $((SERVICE_PORTS_COUNT - 1))); do
+        local service_port=$((service_base + i))
+        incus config device add "$container" "svc-proxy-${i}" proxy \
+            listen=tcp:0.0.0.0:${service_port} \
+            connect=tcp:127.0.0.1:${service_port} \
+            bind=host
+    done
+    
     # Run provisioning script
     info "Provisioning container (this may take a few minutes)..."
     incus exec "$container" -- bash <<PROVISION
@@ -350,7 +373,10 @@ PROVISION
     # Release lock
     flock -u 200
     
-    success "Container '$name' created (SSH port: $port)"
+    local service_base
+    service_base=$(get_service_port_base "$port")
+    local service_end=$((service_base + SERVICE_PORTS_COUNT - 1))
+    success "Container '$name' created (SSH: $port, Services: ${service_base}-${service_end})"
 }
 
 cmd_list() {
@@ -441,9 +467,17 @@ cmd_ssh() {
     port=$(get_port "$name")
     [[ -z "$port" ]] && die "No SSH port found for '$name'"
     
-    echo "ssh -p $port dev@localhost"
+    local service_base
+    service_base=$(get_service_port_base "$port")
+    local service_end=$((service_base + SERVICE_PORTS_COUNT - 1))
+    
+    echo "SSH:"
+    echo "  ssh -p $port dev@localhost"
     echo ""
-    echo "Or add to ~/.ssh/config:"
+    echo "Service ports:"
+    echo "  ${service_base}-${service_end} -> container ${service_base}-${service_end}"
+    echo ""
+    echo "SSH config (~/.ssh/config):"
     echo ""
     echo "Host $name"
     echo "    HostName localhost"
@@ -475,7 +509,7 @@ cmd_delete() {
 }
 
 cmd_ports() {
-    printf "%-20s %-6s %s\n" "NAME" "PORT" "STATUS"
+    printf "%-20s %-8s %-15s %s\n" "NAME" "SSH" "SERVICES" "STATUS"
     
     # Use shared lock for consistent read
     (
@@ -493,7 +527,11 @@ cmd_ports() {
                 status="STOPPED"
             fi
             
-            printf "%-20s %-6s %s\n" "$name" "$port" "$status"
+            local service_base
+            service_base=$(get_service_port_base "$port")
+            local service_end=$((service_base + SERVICE_PORTS_COUNT - 1))
+            
+            printf "%-20s %-8s %-15s %s\n" "$name" "$port" "${service_base}-${service_end}" "$status"
         done < "$PORTS_FILE"
     ) 200>"$LOCK_FILE"
 }
