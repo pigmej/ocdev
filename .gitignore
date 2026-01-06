@@ -1,0 +1,19 @@
+# Nim/Atlas
+cmd/ocdev/deps/
+cmd/ocdev/nim.cfg
+*.o
+*.a
+nimcache/
+
+# Build outputs
+bin/ocdev
+
+# Editor
+*.swp
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

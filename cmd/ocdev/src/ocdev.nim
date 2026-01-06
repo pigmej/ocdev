@@ -1,0 +1,35 @@
+## ocdev - Manage isolated development environments using Incus containers
+import cligen
+import config, commands
+
+# Set version for --version flag
+clCfg.version = Version
+
+when isMainModule:
+  dispatchMulti(
+    [cmdCreate, cmdName = "create", 
+     doc = "Create a new development container",
+     help = {
+       "name": "Container name (alphanumeric and hyphens, max 50 chars)",
+       "postCreate": "Script to run after container provisioning"
+     }],
+    [cmdList, cmdName = "list",
+     doc = "List all ocdev containers"],
+    [cmdStart, cmdName = "start",
+     doc = "Start a stopped container",
+     help = {"name": "Container name"}],
+    [cmdStop, cmdName = "stop",
+     doc = "Stop a running container",
+     help = {"name": "Container name"}],
+    [cmdShell, cmdName = "shell",
+     doc = "Open interactive shell in container",
+     help = {"name": "Container name"}],
+    [cmdSsh, cmdName = "ssh",
+     doc = "Display SSH connection info",
+     help = {"name": "Container name"}],
+    [cmdDelete, cmdName = "delete",
+     doc = "Delete a container",
+     help = {"name": "Container name"}],
+    [cmdPorts, cmdName = "ports",
+     doc = "List all port allocations"]
+  )
