@@ -39,23 +39,27 @@ USAGE:
     ocdev <command> [arguments]
 
 COMMANDS:
-    create <name>    Create a new development container
-    list             List all ocdev containers
-    start <name>     Start a stopped container
-    stop <name>      Stop a running container
-    shell <name>     Open interactive shell in container
-    ssh <name>       Display SSH connection info
-    delete <name>    Delete a container
-    ports            List all port allocations
+    create <name> [options]   Create a new development container
+    list                      List all ocdev containers
+    start <name>              Start a stopped container
+    stop <name>               Stop a running container
+    shell <name>              Open interactive shell in container
+    ssh <name>                Display SSH connection info
+    delete <name>             Delete a container
+    ports                     List all port allocations
 
 OPTIONS:
-    -h, --help       Show this help message
+    -h, --help                Show this help message
+
+CREATE OPTIONS:
+    --post-create <script>    Run script after container provisioning
 
 EXAMPLES:
-    ocdev create myproject    # Create new container
-    ocdev shell myproject     # Open shell
-    ocdev ssh myproject       # Show SSH command
-    ocdev delete myproject    # Delete container
+    ocdev create myproject                        # Create new container
+    ocdev create myproject --post-create ./s.sh   # Create with setup script
+    ocdev shell myproject                         # Open shell
+    ocdev ssh myproject                           # Show SSH command
+    ocdev delete myproject                        # Delete container
 EOF
 }
 
@@ -156,12 +160,42 @@ get_port() {
 #######################################
 
 cmd_create() {
-    [[ $# -lt 1 ]] && { error "Usage: ocdev create <name>"; exit $EXIT_ERROR; }
-    
-    local name="$1"
-    local container="${CONTAINER_PREFIX}${name}"
+    local name=""
+    local post_create_script=""
+    local container=""
     local port=""
     local host_uid=$(id -u)
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --post-create)
+                [[ $# -lt 2 ]] && { error "--post-create requires a script path"; exit $EXIT_ERROR; }
+                post_create_script="$2"
+                shift 2
+                ;;
+            -*)
+                error "Unknown option: $1"
+                error "Usage: ocdev create <name> [--post-create <script>]"
+                exit $EXIT_ERROR
+                ;;
+            *)
+                [[ -n "$name" ]] && { error "Usage: ocdev create <name> [--post-create <script>]"; exit $EXIT_ERROR; }
+                name="$1"
+                shift
+                ;;
+        esac
+    done
+    
+    [[ -z "$name" ]] && { error "Usage: ocdev create <name> [--post-create <script>]"; exit $EXIT_ERROR; }
+    
+    # Validate post-create script if provided
+    if [[ -n "$post_create_script" ]]; then
+        [[ -f "$post_create_script" ]] || die "Post-create script not found: $post_create_script"
+        [[ -r "$post_create_script" ]] || die "Post-create script not readable: $post_create_script"
+    fi
+    
+    container="${CONTAINER_PREFIX}${name}"
     
     # Validate name
     validate_name "$name"
@@ -294,6 +328,20 @@ sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_
 systemctl enable ssh docker
 systemctl start ssh docker
 PROVISION
+    
+    # Run custom post-create script if provided
+    if [[ -n "$post_create_script" ]]; then
+        info "Running post-create script..."
+        incus file push "$post_create_script" "${container}/tmp/ocdev-post-create.sh"
+        incus exec "$container" -- chmod +x /tmp/ocdev-post-create.sh
+        if incus exec "$container" -- su - dev -c /tmp/ocdev-post-create.sh; then
+            incus exec "$container" -- rm -f /tmp/ocdev-post-create.sh
+        else
+            warn "Post-create script failed (container kept for debugging)"
+            warn "Script left at /tmp/ocdev-post-create.sh inside container"
+            warn "Debug with: ocdev shell $name"
+        fi
+    fi
     
     # Success - save port then disable cleanup trap
     echo "${name}:${port}" >> "$PORTS_FILE"

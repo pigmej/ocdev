@@ -10,6 +10,7 @@ A CLI tool to manage isolated development environments using Incus system contai
 - **Shared configs** - Automatically mounts `~/.config`, `~/.opencode`, `~/.ssh`, `~/.gitconfig`
 - **Docker-in-Docker** - Full Docker support via Incus nesting
 - **Low overhead** - ~100-200MB RAM per container vs 512MB+ for VMs
+- **Custom setup scripts** - Run post-create scripts to install additional tools
 
 ## Prerequisites
 
@@ -47,6 +48,9 @@ ln -sf "$(pwd)/bin/ocdev" ~/.local/bin/ocdev
 ocdev create myproject
 # Output: Created ocdev-myproject, SSH: ssh -p 2201 dev@localhost
 
+# Create with a custom setup script
+ocdev create myproject --post-create ~/dotfiles/dev-setup.sh
+
 # List all environments
 ocdev list
 
@@ -77,7 +81,7 @@ ocdev ports
 
 | Command | Description |
 |---------|-------------|
-| `ocdev create <name>` | Create new dev environment |
+| `ocdev create <name> [--post-create <script>]` | Create new dev environment |
 | `ocdev list` | List all dev environments |
 | `ocdev start <name>` | Start a stopped environment |
 | `ocdev stop <name>` | Stop a running environment |
@@ -111,6 +115,39 @@ ocdev ports
 | `~/.opencode` | `/home/dev/.opencode` | read-write |
 | `~/.ssh` | `/home/dev/.ssh` | read-only |
 | `~/.gitconfig` | `/home/dev/.gitconfig` | read-only |
+
+## Custom Setup Scripts
+
+Run a custom script after container provisioning using `--post-create`:
+
+```bash
+ocdev create myproject --post-create ./setup.sh
+```
+
+The script runs as the `dev` user inside the container after base provisioning (Docker, SSH, git, etc. are already installed). The script has:
+- Network access
+- Passwordless sudo via `sudo`
+- Full access to install packages, configure tools, etc.
+
+Example setup script:
+
+```bash
+#!/bin/bash
+# Install additional tools
+sudo apt-get update
+sudo apt-get install -y neovim tmux ripgrep
+
+# Install Node.js via nvm
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+source ~/.nvm/nvm.sh
+nvm install 20
+```
+
+If the post-create script fails, the container is kept so you can debug:
+
+```bash
+ocdev shell myproject  # Debug what went wrong
+```
 
 ## Troubleshooting
 
