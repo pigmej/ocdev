@@ -31,5 +31,18 @@ when isMainModule:
      doc = "Delete a container",
      help = {"name": "Container name"}],
     [cmdPorts, cmdName = "ports",
-     doc = "List all port allocations"]
+     doc = "List all port allocations"],
+    [cmdBind, cmdName = "bind",
+     doc = "Bind a container port to the host",
+     help = {
+       "name": "Container name",
+       "port": "Port to bind (PORT or CONTAINER_PORT:HOST_PORT)",
+       "list": "List current dynamic port bindings"
+     }],
+    [cmdUnbind, cmdName = "unbind",
+     doc = "Remove a port binding",
+     help = {
+       "name": "Container name",
+       "port": "Host port to unbind"
+     }]
   )

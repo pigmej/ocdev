@@ -1,6 +1,71 @@
 ## Command implementations for ocdev
 import std/[os, osproc, strutils, strformat, posix]
-import config, output, container, ports, profile, provision
+import config, output, container, ports, profile, provision, postinstall
+
+const
+  MinPort = 1
+  MaxPort = 65535
+
+proc deviceExists(containerName, deviceName: string): bool =
+  ## Check if a device exists on a container
+  let (output, exitCode) = execCmdEx(fmt"incus config device list {containerName}")
+  if exitCode != 0:
+    return false
+  for line in output.strip().splitLines():
+    if line.strip() == deviceName:
+      return true
+  return false
+
+proc parsePortArg(portArg: string): tuple[containerPort, hostPort: int, valid: bool, errMsg: string] =
+  ## Parse port argument: "PORT" or "CONTAINER_PORT:HOST_PORT"
+  ## Returns (containerPort, hostPort, valid, errorMessage)
+  if ':' in portArg:
+    let parts = portArg.split(':')
+    if parts.len != 2:
+      return (0, 0, false, "Invalid port format. Use PORT or CONTAINER_PORT:HOST_PORT")
+    let containerPort = try: parseInt(parts[0]) except ValueError: 0
+    let hostPort = try: parseInt(parts[1]) except ValueError: 0
+    if containerPort == 0 or hostPort == 0:
+      return (0, 0, false, "Invalid port numbers")
+    if containerPort < MinPort or containerPort > MaxPort:
+      return (0, 0, false, fmt"Container port must be between {MinPort} and {MaxPort}")
+    if hostPort < MinPort or hostPort > MaxPort:
+      return (0, 0, false, fmt"Host port must be between {MinPort} and {MaxPort}")
+    return (containerPort, hostPort, true, "")
+  else:
+    let port = try: parseInt(portArg) except ValueError: 0
+    if port == 0:
+      return (0, 0, false, "Invalid port number")
+    if port < MinPort or port > MaxPort:
+      return (0, 0, false, fmt"Port must be between {MinPort} and {MaxPort}")
+    return (port, port, true, "")
+
+proc getDynamicBindings(containerName: string): seq[tuple[hostPort, containerPort: int]] =
+  ## Get all dynamic port bindings (dyn-* devices) for a container
+  var bindings: seq[tuple[hostPort, containerPort: int]] = @[]
+  
+  let (deviceList, exitCode) = execCmdEx(fmt"incus config device list {containerName}")
+  if exitCode != 0:
+    return bindings
+  
+  for line in deviceList.strip().splitLines():
+    let deviceName = line.strip()
+    if deviceName.startsWith("dyn-"):
+      # Extract host port from device name
+      let hostPortStr = deviceName[4..^1]
+      let hostPort = try: parseInt(hostPortStr) except ValueError: 0
+      if hostPort > 0:
+        # Get device details to find container port
+        let (deviceInfo, _) = execCmdEx(fmt"incus config device get {containerName} {deviceName} connect")
+        # Format: tcp:127.0.0.1:<port>
+        let connectStr = deviceInfo.strip()
+        if connectStr.startsWith("tcp:127.0.0.1:"):
+          let containerPortStr = connectStr[14..^1]
+          let containerPort = try: parseInt(containerPortStr) except ValueError: 0
+          if containerPort > 0:
+            bindings.add((hostPort, containerPort))
+  
+  return bindings
 
 proc checkPrerequisites(): int =
   ## Check incus command and group membership
@@ -123,6 +188,20 @@ proc cmdCreate*(name: string, postCreate = ""): int =
     error("Provisioning failed")
     doCleanup()
     return ord(ecError)
+  
+  # Run default post-install script as dev user
+  info("Installing dev tools (uv, nvm, opencode)...")
+  let postInstallTmp = getTempDir() / "ocdev-postinstall.sh"
+  writeFile(postInstallTmp, PostInstallScript)
+  defer: removeFile(postInstallTmp)
+  
+  discard execCmd(fmt"incus file push {postInstallTmp} {containerName}/tmp/postinstall.sh")
+  discard execCmd(fmt"incus exec {containerName} -- chmod +x /tmp/postinstall.sh")
+  let postInstallExit = execCmd(fmt"incus exec {containerName} -- su - dev -c /tmp/postinstall.sh")
+  discard execCmd(fmt"incus exec {containerName} -- rm -f /tmp/postinstall.sh")
+  
+  if postInstallExit != 0:
+    warn("Default post-install completed with warnings (continuing...)")
   
   # Add disk devices (after provisioning so /home/dev is owned by dev user)
   info("Configuring disk mounts...")
@@ -369,4 +448,101 @@ proc cmdPorts*(): int =
       
       echo name.alignLeft(20) & " " & ($port).alignLeft(8) & " " & services.alignLeft(15) & " " & status
   
+  result = ord(ecSuccess)
+
+proc cmdBind*(name: string, port = "", list = false): int =
+  ## Bind a container port to the host, or list current bindings
+  ##
+  ## Examples:
+  ##   ocdev bind myvm 5173           # Bind host:5173 -> container:5173
+  ##   ocdev bind myvm 3000:8080      # Bind host:8080 -> container:3000
+  ##   ocdev bind myvm --list         # List current dynamic bindings
+  
+  let prereq = checkPrerequisites()
+  if prereq != 0:
+    return prereq
+  
+  if not containerExists(name):
+    error(fmt"Container '{name}' not found")
+    return ord(ecNotFound)
+  
+  let containerName = ContainerPrefix & name
+  
+  # List mode
+  if list:
+    let bindings = getDynamicBindings(containerName)
+    if bindings.len == 0:
+      info("No dynamic port bindings")
+      return ord(ecSuccess)
+    
+    echo "HOST".alignLeft(10) & " CONTAINER"
+    for binding in bindings:
+      echo ($binding.hostPort).alignLeft(10) & " " & $binding.containerPort
+    return ord(ecSuccess)
+  
+  # Bind mode - port argument required
+  if port.len == 0:
+    error("Port argument required (or use --list)")
+    return ord(ecError)
+  
+  let (containerPort, hostPort, valid, errMsg) = parsePortArg(port)
+  if not valid:
+    error(errMsg)
+    return ord(ecError)
+  
+  let deviceName = fmt"dyn-{hostPort}"
+  
+  # Check if already bound
+  if deviceExists(containerName, deviceName):
+    error(fmt"Port {hostPort} is already bound to this container")
+    return ord(ecError)
+  
+  # Add proxy device
+  let exitCode = execCmd(fmt"incus config device add {containerName} {deviceName} proxy " &
+                         fmt"listen=tcp:0.0.0.0:{hostPort} connect=tcp:127.0.0.1:{containerPort} bind=host")
+  if exitCode != 0:
+    error(fmt"Failed to bind port {hostPort}")
+    return ord(ecError)
+  
+  if containerPort == hostPort:
+    success(fmt"Bound port {hostPort}")
+  else:
+    success(fmt"Bound host:{hostPort} -> container:{containerPort}")
+  
+  result = ord(ecSuccess)
+
+proc cmdUnbind*(name: string, port: int): int =
+  ## Remove a port binding from a container
+  ##
+  ## Examples:
+  ##   ocdev unbind myvm 5173         # Remove binding on host port 5173
+  
+  let prereq = checkPrerequisites()
+  if prereq != 0:
+    return prereq
+  
+  if not containerExists(name):
+    error(fmt"Container '{name}' not found")
+    return ord(ecNotFound)
+  
+  # Validate port range
+  if port < MinPort or port > MaxPort:
+    error(fmt"Port must be between {MinPort} and {MaxPort}")
+    return ord(ecError)
+  
+  let containerName = ContainerPrefix & name
+  let deviceName = fmt"dyn-{port}"
+  
+  # Check if binding exists
+  if not deviceExists(containerName, deviceName):
+    error(fmt"Port {port} is not bound to this container")
+    return ord(ecError)
+  
+  # Remove proxy device
+  let exitCode = execCmd(fmt"incus config device remove {containerName} {deviceName}")
+  if exitCode != 0:
+    error(fmt"Failed to unbind port {port}")
+    return ord(ecError)
+  
+  success(fmt"Unbound port {port}")
   result = ord(ecSuccess)
