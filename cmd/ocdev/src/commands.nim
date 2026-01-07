@@ -145,6 +145,14 @@ proc cmdCreate*(name: string, postCreate = ""): int =
     discard execCmd(fmt"incus config device add {containerName} host-gitconfig disk " &
                    fmt"source={homeDir}/.gitconfig path=/home/dev/.gitconfig readonly=true shift=true")
   
+  if dirExists(homeDir / ".local" / "share" / "opencode"):
+    discard execCmd(fmt"incus config device add {containerName} host-oc-share disk " &
+                   fmt"source={homeDir}/.local/share/opencode path=/home/dev/.local/share/opencode shift=true")
+  
+  if dirExists(homeDir / ".local" / "state" / "opencode"):
+    discard execCmd(fmt"incus config device add {containerName} host-oc-state disk " &
+                   fmt"source={homeDir}/.local/state/opencode path=/home/dev/.local/state/opencode shift=true")
+  
   # Run custom post-create script if provided
   if postCreate.len > 0:
     info("Running post-create script...")
