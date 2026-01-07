@@ -92,27 +92,6 @@ proc cmdCreate*(name: string, postCreate = ""): int =
     doCleanup()
     return ord(ecError)
   
-  # Add disk devices
-  info("Configuring disk mounts...")
-  
-  let homeDir = getHomeDir()
-  
-  if dirExists(homeDir / ".config"):
-    discard execCmd(fmt"incus config device add {containerName} host-config disk " &
-                   fmt"source={homeDir}/.config path=/home/dev/.config shift=true")
-  
-  if dirExists(homeDir / ".opencode"):
-    discard execCmd(fmt"incus config device add {containerName} host-opencode disk " &
-                   fmt"source={homeDir}/.opencode path=/home/dev/.opencode shift=true")
-  
-  if dirExists(homeDir / ".ssh"):
-    discard execCmd(fmt"incus config device add {containerName} host-ssh disk " &
-                   fmt"source={homeDir}/.ssh path=/home/dev/.ssh readonly=true shift=true")
-  
-  if fileExists(homeDir / ".gitconfig"):
-    discard execCmd(fmt"incus config device add {containerName} host-gitconfig disk " &
-                   fmt"source={homeDir}/.gitconfig path=/home/dev/.gitconfig readonly=true shift=true")
-  
   # Add SSH proxy device
   info(fmt"Configuring SSH proxy on port {port}...")
   discard execCmd(fmt"incus config device add {containerName} ssh-proxy proxy " &
@@ -144,6 +123,27 @@ proc cmdCreate*(name: string, postCreate = ""): int =
     error("Provisioning failed")
     doCleanup()
     return ord(ecError)
+  
+  # Add disk devices (after provisioning so /home/dev is owned by dev user)
+  info("Configuring disk mounts...")
+  
+  let homeDir = getHomeDir()
+  
+  if dirExists(homeDir / ".config"):
+    discard execCmd(fmt"incus config device add {containerName} host-config disk " &
+                   fmt"source={homeDir}/.config path=/home/dev/.config shift=true")
+  
+  if dirExists(homeDir / ".opencode"):
+    discard execCmd(fmt"incus config device add {containerName} host-opencode disk " &
+                   fmt"source={homeDir}/.opencode path=/home/dev/.opencode shift=true")
+  
+  if dirExists(homeDir / ".ssh"):
+    discard execCmd(fmt"incus config device add {containerName} host-ssh disk " &
+                   fmt"source={homeDir}/.ssh path=/home/dev/.ssh readonly=true shift=true")
+  
+  if fileExists(homeDir / ".gitconfig"):
+    discard execCmd(fmt"incus config device add {containerName} host-gitconfig disk " &
+                   fmt"source={homeDir}/.gitconfig path=/home/dev/.gitconfig readonly=true shift=true")
   
   # Run custom post-create script if provided
   if postCreate.len > 0:
