@@ -1,5 +1,5 @@
 ## Container state helper functions
-import std/[osproc, strutils]
+import std/[osproc, strutils, strformat]
 import config
 
 proc containerExists*(name: string): bool =
@@ -20,6 +20,21 @@ proc containerRunning*(name: string): bool =
   for line in output.splitLines():
     if line.startsWith("Status:"):
       return "RUNNING" in line
+  result = false
+
+proc snapshotExists*(containerName, snapshotName: string): bool =
+  ## Check if snapshot exists on container
+  ## Uses: incus snapshot list <container> --format=csv
+  let fullName = ContainerPrefix & containerName
+  let (output, exitCode) = execCmdEx(fmt"incus snapshot list {fullName} --format=csv 2>/dev/null")
+  if exitCode != 0:
+    return false
+  for line in output.strip().splitLines():
+    if line.len == 0:
+      continue
+    let parts = line.split(',')
+    if parts.len > 0 and parts[0] == snapshotName:
+      return true
   result = false
 
 proc validateName*(name: string): tuple[valid: bool, msg: string] =

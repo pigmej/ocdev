@@ -67,6 +67,37 @@ proc getDynamicBindings(containerName: string): seq[tuple[hostPort, containerPor
   
   return bindings
 
+proc reconfigureProxyDevices(containerName: string, port: int): int =
+  ## Remove inherited proxy devices and add new ones with correct ports
+  ## Preserves dynamic bindings (dyn-*) as they are user-configured
+  var standardDevices = @["ssh-proxy"]
+  for i in 0 ..< ServicePortsCount:
+    standardDevices.add("svc-proxy-" & $i)
+  
+  for device in standardDevices:
+    if deviceExists(containerName, device):
+      let exitCode = execCmd(fmt"incus config device remove {containerName} {device}")
+      if exitCode != 0:
+        error(fmt"Failed to remove device {device}")
+        return exitCode
+  
+  var exitCode = execCmd(fmt"incus config device add {containerName} ssh-proxy proxy " &
+                         fmt"listen=tcp:0.0.0.0:{port} connect=tcp:127.0.0.1:22 bind=host")
+  if exitCode != 0:
+    error("Failed to add SSH proxy device")
+    return exitCode
+  
+  let serviceBase = getServicePortBase(port)
+  for i in 0 ..< ServicePortsCount:
+    let servicePort = serviceBase + i
+    exitCode = execCmd(fmt"incus config device add {containerName} svc-proxy-{i} proxy " &
+                       fmt"listen=tcp:0.0.0.0:{servicePort} connect=tcp:127.0.0.1:{servicePort} bind=host")
+    if exitCode != 0:
+      error(fmt"Failed to add service proxy device {i}")
+      return exitCode
+  
+  result = 0
+
 proc checkPrerequisites(): int =
   ## Check incus command and group membership
   let (_, exitCode) = execCmdEx("command -v incus")
@@ -86,7 +117,7 @@ proc checkPrerequisites(): int =
   
   result = ord(ecSuccess)
 
-proc cmdCreate*(name: string, postCreate = ""): int =
+proc cmdCreate*(name: string, postCreate = "", fromSnapshot = ""): int =
   ## Create a new development container
   ## 
   ## Creates an Incus container with:
@@ -118,6 +149,101 @@ proc cmdCreate*(name: string, postCreate = ""): int =
       return ord(ecError)
   
   let containerName = ContainerPrefix & name
+  
+  # Handle snapshot clone flow
+  if fromSnapshot.len > 0:
+    # Parse fromSnapshot (format: container/snapshot)
+    let snapshotParts = fromSnapshot.split('/')
+    if snapshotParts.len != 2:
+      error("Invalid snapshot format. Use: container/snapshot")
+      return ord(ecError)
+    
+    let sourceContainer = snapshotParts[0]
+    let snapshotName = snapshotParts[1]
+    
+    # Validate source container exists
+    if not containerExists(sourceContainer):
+      error(fmt"Source container '{sourceContainer}' not found")
+      return ord(ecNotFound)
+    
+    # Validate snapshot exists
+    if not snapshotExists(sourceContainer, snapshotName):
+      error(fmt"Snapshot '{snapshotName}' not found on container '{sourceContainer}'")
+      return ord(ecNotFound)
+    
+    # Check destination doesn't exist
+    if containerExists(name):
+      error("Container '" & name & "' already exists")
+      return ord(ecError)
+    
+    # Allocate port with lock
+    var port: int
+    try:
+      port = withLock(exclusive = true) do -> int:
+        allocatePort()
+    except IOError as e:
+      error("Failed to allocate port: " & e.msg)
+      return ord(ecError)
+    except ValueError as e:
+      error(e.msg)
+      return ord(ecError)
+    
+    # Cleanup function for failure
+    var cleanupNeeded = true
+    proc doCleanup() =
+      if cleanupNeeded:
+        warn("Cleaning up failed container...")
+        discard execCmd("incus delete --force " & containerName & " 2>/dev/null")
+    
+    let sourceFullName = ContainerPrefix & sourceContainer
+    info(fmt"Cloning container from {sourceContainer}/{snapshotName}...")
+    
+    # Clone from snapshot
+    var exitCode = execCmd(fmt"incus copy {sourceFullName}/{snapshotName} {containerName}")
+    if exitCode != 0:
+      error("Failed to clone from snapshot")
+      doCleanup()
+      return ord(ecError)
+    
+    # Reconfigure proxy devices with new ports
+    info(fmt"Configuring ports (SSH: {port})...")
+    exitCode = reconfigureProxyDevices(containerName, port)
+    if exitCode != 0:
+      doCleanup()
+      return ord(ecError)
+    
+    # Start container
+    info("Starting container...")
+    exitCode = execCmd(fmt"incus start {containerName}")
+    if exitCode != 0:
+      error("Failed to start container")
+      doCleanup()
+      return ord(ecError)
+    
+    # Run custom post-create script if provided
+    if postCreate.len > 0:
+      info("Running post-create script...")
+      discard execCmd(fmt"incus file push {postCreate} {containerName}/tmp/ocdev-post-create.sh")
+      discard execCmd(fmt"incus exec {containerName} -- chmod +x /tmp/ocdev-post-create.sh")
+      
+      exitCode = execCmd(fmt"incus exec {containerName} -- su - dev -c /tmp/ocdev-post-create.sh")
+      if exitCode == 0:
+        discard execCmd(fmt"incus exec {containerName} -- rm -f /tmp/ocdev-post-create.sh")
+      else:
+        warn("Post-create script failed (container kept for debugging)")
+        warn("Script left at /tmp/ocdev-post-create.sh inside container")
+        warn(fmt"Debug with: ocdev shell {name}")
+    
+    # Success - save port allocation
+    withLockVoid(exclusive = true) do ():
+      savePortAllocation(name, port)
+    
+    cleanupNeeded = false
+    
+    let serviceBase = getServicePortBase(port)
+    let serviceEnd = serviceBase + ServicePortsCount - 1
+    success(fmt"Container '{name}' created from snapshot (SSH: {port}, Services: {serviceBase}-{serviceEnd})")
+    return ord(ecSuccess)
   
   # Check container doesn't already exist
   if containerExists(name):

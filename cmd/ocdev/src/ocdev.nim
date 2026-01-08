@@ -11,7 +11,8 @@ when isMainModule:
      doc = "Create a new development container",
      help = {
        "name": "Container name (alphanumeric and hyphens, max 50 chars)",
-       "postCreate": "Script to run after container provisioning"
+       "postCreate": "Script to run after container creation",
+       "fromSnapshot": "Create from snapshot (format: container/snapshot)"
      }],
     [cmdList, cmdName = "list",
      doc = "List all ocdev containers"],
