@@ -69,10 +69,15 @@ proc getDynamicBindings(containerName: string): seq[tuple[hostPort, containerPor
 
 proc reconfigureProxyDevices(containerName: string, port: int): int =
   ## Remove inherited proxy devices and add new ones with correct ports
-  ## Preserves dynamic bindings (dyn-*) as they are user-configured
+  ## Also removes dynamic bindings (dyn-*) to avoid port conflicts with source container
   var standardDevices = @["ssh-proxy"]
   for i in 0 ..< ServicePortsCount:
     standardDevices.add("svc-proxy-" & $i)
+  
+  # Also remove dynamic bindings - they would conflict with source container
+  let dynamicBindings = getDynamicBindings(containerName)
+  for binding in dynamicBindings:
+    standardDevices.add("dyn-" & $binding.hostPort)
   
   for device in standardDevices:
     if deviceExists(containerName, device):
