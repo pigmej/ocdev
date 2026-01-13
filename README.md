@@ -2,6 +2,8 @@
 
 A CLI tool to manage isolated development environments using Incus system containers. Each environment comes with Docker pre-installed, SSH access, and shared host configurations.
 
+This is especially useful when you need to run **complex projects requiring multiple containers locally** and switch between them quickly. The port forwarding system lets you access services across containers seamlessly, while directory mounts keep your configs and code synchronized.
+
 ## Features
 
 - **Isolated dev environments** - Each container is fully isolated with its own Docker daemon
