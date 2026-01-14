@@ -40,6 +40,10 @@ proc parsePortArg(portArg: string): tuple[containerPort, hostPort: int, valid: b
       return (0, 0, false, fmt"Port must be between {MinPort} and {MaxPort}")
     return (port, port, true, "")
 
+const
+  DynDevicePrefix = "dyn-"
+  TcpConnectPrefix = "tcp:127.0.0.1:"
+
 proc getDynamicBindings(containerName: string): seq[tuple[hostPort, containerPort: int]] =
   ## Get all dynamic port bindings (dyn-* devices) for a container
   var bindings: seq[tuple[hostPort, containerPort: int]] = @[]
@@ -50,22 +54,30 @@ proc getDynamicBindings(containerName: string): seq[tuple[hostPort, containerPor
   
   for line in deviceList.strip().splitLines():
     let deviceName = line.strip()
-    if deviceName.startsWith("dyn-"):
+    if deviceName.startsWith(DynDevicePrefix):
       # Extract host port from device name
-      let hostPortStr = deviceName[4..^1]
-      let hostPort = try: parseInt(hostPortStr) except ValueError: 0
+      let hostPortStr = deviceName[DynDevicePrefix.len..^1]
+      let hostPort = try: parseInt(hostPortStr) except ValueError: -1
+      if hostPort < 0:
+        warn(fmt"Skipping malformed dynamic binding device: {deviceName}")
+        continue
       if hostPort > 0:
         # Get device details to find container port
         let (deviceInfo, _) = execCmdEx(fmt"incus config device get {containerName} {deviceName} connect")
         # Format: tcp:127.0.0.1:<port>
         let connectStr = deviceInfo.strip()
-        if connectStr.startsWith("tcp:127.0.0.1:"):
-          let containerPortStr = connectStr[14..^1]
-          let containerPort = try: parseInt(containerPortStr) except ValueError: 0
+        if connectStr.startsWith(TcpConnectPrefix):
+          let containerPortStr = connectStr[TcpConnectPrefix.len..^1]
+          let containerPort = try: parseInt(containerPortStr) except ValueError: -1
+          if containerPort < 0:
+            warn(fmt"Skipping malformed container port in {deviceName}: {connectStr}")
+            continue
           if containerPort > 0:
             bindings.add((hostPort, containerPort))
+        else:
+          warn(fmt"Unexpected connect format for {deviceName}: {connectStr}")
   
-  return bindings
+  result = bindings
 
 proc reconfigureProxyDevices(containerName: string, port: int): int =
   ## Remove inherited proxy devices and add new ones with correct ports
@@ -99,6 +111,140 @@ proc reconfigureProxyDevices(containerName: string, port: int): int =
                        fmt"listen=tcp:0.0.0.0:{servicePort} connect=tcp:127.0.0.1:{servicePort} bind=host")
     if exitCode != 0:
       error(fmt"Failed to add service proxy device {i}")
+      return exitCode
+  
+  result = 0
+
+# --- Container cleanup helper ---
+
+type
+  ContainerCleanup* = object
+    ## Tracks whether a container needs cleanup on failure
+    containerName: string
+    needed: bool
+
+proc initCleanup(containerName: string): ContainerCleanup =
+  ## Initialize cleanup tracker for a container
+  ContainerCleanup(containerName: containerName, needed: true)
+
+proc run(c: var ContainerCleanup) =
+  ## Execute cleanup if needed (delete the container)
+  if c.needed:
+    warn("Cleaning up failed container...")
+    discard execCmd("incus delete --force " & c.containerName & " 2>/dev/null")
+
+proc cancel(c: var ContainerCleanup) =
+  ## Mark cleanup as no longer needed (success path)
+  c.needed = false
+
+# --- Port allocation helper ---
+
+proc allocatePortSafe(): tuple[port: int, err: string] =
+  ## Allocate port with lock and error handling
+  ## Returns (port, "") on success or (0, errorMsg) on failure
+  try:
+    let port = withLock(exclusive = true) do -> int:
+      allocatePort()
+    return (port, "")
+  except IOError as e:
+    return (0, "Failed to allocate port: " & e.msg)
+  except ValueError as e:
+    return (0, e.msg)
+
+# --- Post-create script helper ---
+
+proc runPostCreateScript(containerName, name, scriptPath: string): bool =
+  ## Push and run post-create script as dev user
+  ## Returns true on success, false on failure (logs warnings)
+  let pushExit = execCmd(fmt"incus file push {scriptPath} {containerName}/tmp/ocdev-post-create.sh")
+  if pushExit != 0:
+    warn("Failed to push post-create script")
+    return false
+  
+  let chmodExit = execCmd(fmt"incus exec {containerName} -- chmod +x /tmp/ocdev-post-create.sh")
+  if chmodExit != 0:
+    warn("Failed to set script permissions")
+    return false
+  
+  let exitCode = execCmd(fmt"incus exec {containerName} -- su - dev -c /tmp/ocdev-post-create.sh")
+  if exitCode == 0:
+    discard execCmd(fmt"incus exec {containerName} -- rm -f /tmp/ocdev-post-create.sh")
+    return true
+  else:
+    warn("Post-create script failed (container kept for debugging)")
+    warn("Script left at /tmp/ocdev-post-create.sh inside container")
+    warn(fmt"Debug with: ocdev shell {name}")
+    return false
+
+# --- Proxy device helper ---
+
+proc addProxyDevices(containerName: string, sshPort: int): int =
+  ## Add SSH and service proxy devices to container
+  ## Returns 0 on success, non-zero on failure
+  var exitCode = execCmd(fmt"incus config device add {containerName} ssh-proxy proxy " &
+                         fmt"listen=tcp:0.0.0.0:{sshPort} connect=tcp:127.0.0.1:22 bind=host")
+  if exitCode != 0:
+    error("Failed to add SSH proxy device")
+    return exitCode
+  
+  let serviceBase = getServicePortBase(sshPort)
+  for i in 0 ..< ServicePortsCount:
+    let servicePort = serviceBase + i
+    exitCode = execCmd(fmt"incus config device add {containerName} svc-proxy-{i} proxy " &
+                       fmt"listen=tcp:0.0.0.0:{servicePort} connect=tcp:127.0.0.1:{servicePort} bind=host")
+    if exitCode != 0:
+      error(fmt"Failed to add service proxy device {i}")
+      return exitCode
+  
+  result = 0
+
+# --- Disk mount helper ---
+
+proc addDiskMounts(containerName: string): int =
+  ## Add host directory disk mounts to container
+  ## Returns 0 on success, non-zero on failure
+  let homeDir = getHomeDir()
+  
+  if dirExists(homeDir / ".config"):
+    let exitCode = execCmd(fmt"incus config device add {containerName} host-config disk " &
+                           fmt"source={homeDir}/.config path=/home/dev/.config shift=true")
+    if exitCode != 0:
+      error("Failed to mount ~/.config")
+      return exitCode
+  
+  if dirExists(homeDir / ".opencode"):
+    let exitCode = execCmd(fmt"incus config device add {containerName} host-opencode disk " &
+                           fmt"source={homeDir}/.opencode path=/home/dev/.opencode shift=true")
+    if exitCode != 0:
+      error("Failed to mount ~/.opencode")
+      return exitCode
+  
+  if dirExists(homeDir / ".ssh"):
+    let exitCode = execCmd(fmt"incus config device add {containerName} host-ssh disk " &
+                           fmt"source={homeDir}/.ssh path=/home/dev/.ssh readonly=true shift=true")
+    if exitCode != 0:
+      error("Failed to mount ~/.ssh")
+      return exitCode
+  
+  if fileExists(homeDir / ".gitconfig"):
+    let exitCode = execCmd(fmt"incus config device add {containerName} host-gitconfig disk " &
+                           fmt"source={homeDir}/.gitconfig path=/home/dev/.gitconfig readonly=true shift=true")
+    if exitCode != 0:
+      error("Failed to mount ~/.gitconfig")
+      return exitCode
+  
+  if dirExists(homeDir / ".local" / "share" / "opencode"):
+    let exitCode = execCmd(fmt"incus config device add {containerName} host-oc-share disk " &
+                           fmt"source={homeDir}/.local/share/opencode path=/home/dev/.local/share/opencode shift=true")
+    if exitCode != 0:
+      error("Failed to mount ~/.local/share/opencode")
+      return exitCode
+  
+  if dirExists(homeDir / ".local" / "state" / "opencode"):
+    let exitCode = execCmd(fmt"incus config device add {containerName} host-oc-state disk " &
+                           fmt"source={homeDir}/.local/state/opencode path=/home/dev/.local/state/opencode shift=true")
+    if exitCode != 0:
+      error("Failed to mount ~/.local/state/opencode")
       return exitCode
   
   result = 0
@@ -181,24 +327,13 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = ""): int =
       error("Container '" & name & "' already exists")
       return ord(ecError)
     
-    # Allocate port with lock
-    var port: int
-    try:
-      port = withLock(exclusive = true) do -> int:
-        allocatePort()
-    except IOError as e:
-      error("Failed to allocate port: " & e.msg)
-      return ord(ecError)
-    except ValueError as e:
-      error(e.msg)
+    # Allocate port
+    let (port, portErr) = allocatePortSafe()
+    if portErr.len > 0:
+      error(portErr)
       return ord(ecError)
     
-    # Cleanup function for failure
-    var cleanupNeeded = true
-    proc doCleanup() =
-      if cleanupNeeded:
-        warn("Cleaning up failed container...")
-        discard execCmd("incus delete --force " & containerName & " 2>/dev/null")
+    var cleanup = initCleanup(containerName)
     
     let sourceFullName = ContainerPrefix & sourceContainer
     info(fmt"Cloning container from {sourceContainer}/{snapshotName}...")
@@ -207,14 +342,14 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = ""): int =
     var exitCode = execCmd(fmt"incus copy {sourceFullName}/{snapshotName} {containerName}")
     if exitCode != 0:
       error("Failed to clone from snapshot")
-      doCleanup()
+      cleanup.run()
       return ord(ecError)
     
     # Reconfigure proxy devices with new ports
     info(fmt"Configuring ports (SSH: {port})...")
     exitCode = reconfigureProxyDevices(containerName, port)
     if exitCode != 0:
-      doCleanup()
+      cleanup.run()
       return ord(ecError)
     
     # Start container
@@ -222,28 +357,19 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = ""): int =
     exitCode = execCmd(fmt"incus start {containerName}")
     if exitCode != 0:
       error("Failed to start container")
-      doCleanup()
+      cleanup.run()
       return ord(ecError)
     
     # Run custom post-create script if provided
     if postCreate.len > 0:
       info("Running post-create script...")
-      discard execCmd(fmt"incus file push {postCreate} {containerName}/tmp/ocdev-post-create.sh")
-      discard execCmd(fmt"incus exec {containerName} -- chmod +x /tmp/ocdev-post-create.sh")
-      
-      exitCode = execCmd(fmt"incus exec {containerName} -- su - dev -c /tmp/ocdev-post-create.sh")
-      if exitCode == 0:
-        discard execCmd(fmt"incus exec {containerName} -- rm -f /tmp/ocdev-post-create.sh")
-      else:
-        warn("Post-create script failed (container kept for debugging)")
-        warn("Script left at /tmp/ocdev-post-create.sh inside container")
-        warn(fmt"Debug with: ocdev shell {name}")
+      discard runPostCreateScript(containerName, name, postCreate)
     
     # Success - save port allocation
     withLockVoid(exclusive = true) do ():
       savePortAllocation(name, port)
     
-    cleanupNeeded = false
+    cleanup.cancel()
     
     let serviceBase = getServicePortBase(port)
     let serviceEnd = serviceBase + ServicePortsCount - 1
@@ -258,25 +384,13 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = ""): int =
   # Ensure profile exists
   ensureProfile()
   
-  # Allocate port with lock
-  var port: int
-  try:
-    port = withLock(exclusive = true) do -> int:
-      allocatePort()
-  except IOError as e:
-    error("Failed to allocate port: " & e.msg)
-    return ord(ecError)
-  except ValueError as e:
-    error(e.msg)
+  # Allocate port
+  let (port, portErr) = allocatePortSafe()
+  if portErr.len > 0:
+    error(portErr)
     return ord(ecError)
   
-  # Cleanup function for failure - track if cleanup is needed
-  var cleanupNeeded = true
-  
-  proc doCleanup() =
-    if cleanupNeeded:
-      warn("Cleaning up failed container...")
-      discard execCmd("incus delete --force " & containerName & " 2>/dev/null")
+  var cleanup = initCleanup(containerName)
   
   info(fmt"Creating container '{name}' with SSH port {port}...")
   
@@ -285,21 +399,16 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = ""): int =
                          " --profile default --profile " & ProfileName)
   if exitCode != 0:
     error("Failed to launch container")
-    doCleanup()
+    cleanup.run()
     return ord(ecError)
   
-  # Add SSH proxy device
-  info(fmt"Configuring SSH proxy on port {port}...")
-  discard execCmd(fmt"incus config device add {containerName} ssh-proxy proxy " &
-                 fmt"listen=tcp:0.0.0.0:{port} connect=tcp:127.0.0.1:22 bind=host")
-  
-  # Add service port proxy devices
+  # Add proxy devices (SSH + service ports)
   let serviceBase = getServicePortBase(port)
-  info(fmt"Configuring service ports {serviceBase}-{serviceBase + ServicePortsCount - 1}...")
-  for i in 0 ..< ServicePortsCount:
-    let servicePort = serviceBase + i
-    discard execCmd(fmt"incus config device add {containerName} svc-proxy-{i} proxy " &
-                   fmt"listen=tcp:0.0.0.0:{servicePort} connect=tcp:127.0.0.1:{servicePort} bind=host")
+  info(fmt"Configuring ports (SSH: {port}, Services: {serviceBase}-{serviceBase + ServicePortsCount - 1})...")
+  exitCode = addProxyDevices(containerName, port)
+  if exitCode != 0:
+    cleanup.run()
+    return ord(ecError)
   
   # Run provisioning script
   info("Provisioning container (this may take a few minutes)...")
@@ -311,13 +420,18 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = ""): int =
   writeFile(tmpFile, provisionScript)
   defer: removeFile(tmpFile)
   
-  discard execCmd(fmt"incus file push {tmpFile} {containerName}/tmp/provision.sh")
+  let pushExit = execCmd(fmt"incus file push {tmpFile} {containerName}/tmp/provision.sh")
+  if pushExit != 0:
+    error("Failed to push provisioning script")
+    cleanup.run()
+    return ord(ecError)
+  
   exitCode = execCmd(fmt"incus exec {containerName} -- bash /tmp/provision.sh")
   discard execCmd(fmt"incus exec {containerName} -- rm -f /tmp/provision.sh")
   
   if exitCode != 0:
     error("Provisioning failed")
-    doCleanup()
+    cleanup.run()
     return ord(ecError)
   
   # Run default post-install script as dev user
@@ -326,62 +440,34 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = ""): int =
   writeFile(postInstallTmp, PostInstallScript)
   defer: removeFile(postInstallTmp)
   
-  discard execCmd(fmt"incus file push {postInstallTmp} {containerName}/tmp/postinstall.sh")
-  discard execCmd(fmt"incus exec {containerName} -- chmod +x /tmp/postinstall.sh")
-  let postInstallExit = execCmd(fmt"incus exec {containerName} -- su - dev -c /tmp/postinstall.sh")
-  discard execCmd(fmt"incus exec {containerName} -- rm -f /tmp/postinstall.sh")
-  
-  if postInstallExit != 0:
-    warn("Default post-install completed with warnings (continuing...)")
+  let postInstallPush = execCmd(fmt"incus file push {postInstallTmp} {containerName}/tmp/postinstall.sh")
+  if postInstallPush != 0:
+    warn("Failed to push post-install script, skipping dev tools...")
+  else:
+    discard execCmd(fmt"incus exec {containerName} -- chmod +x /tmp/postinstall.sh")
+    let postInstallExit = execCmd(fmt"incus exec {containerName} -- su - dev -c /tmp/postinstall.sh")
+    discard execCmd(fmt"incus exec {containerName} -- rm -f /tmp/postinstall.sh")
+    
+    if postInstallExit != 0:
+      warn("Default post-install completed with warnings (continuing...)")
   
   # Add disk devices (after provisioning so /home/dev is owned by dev user)
   info("Configuring disk mounts...")
-  
-  let homeDir = getHomeDir()
-  
-  if dirExists(homeDir / ".config"):
-    discard execCmd(fmt"incus config device add {containerName} host-config disk " &
-                   fmt"source={homeDir}/.config path=/home/dev/.config shift=true")
-  
-  if dirExists(homeDir / ".opencode"):
-    discard execCmd(fmt"incus config device add {containerName} host-opencode disk " &
-                   fmt"source={homeDir}/.opencode path=/home/dev/.opencode shift=true")
-  
-  if dirExists(homeDir / ".ssh"):
-    discard execCmd(fmt"incus config device add {containerName} host-ssh disk " &
-                   fmt"source={homeDir}/.ssh path=/home/dev/.ssh readonly=true shift=true")
-  
-  if fileExists(homeDir / ".gitconfig"):
-    discard execCmd(fmt"incus config device add {containerName} host-gitconfig disk " &
-                   fmt"source={homeDir}/.gitconfig path=/home/dev/.gitconfig readonly=true shift=true")
-  
-  if dirExists(homeDir / ".local" / "share" / "opencode"):
-    discard execCmd(fmt"incus config device add {containerName} host-oc-share disk " &
-                   fmt"source={homeDir}/.local/share/opencode path=/home/dev/.local/share/opencode shift=true")
-  
-  if dirExists(homeDir / ".local" / "state" / "opencode"):
-    discard execCmd(fmt"incus config device add {containerName} host-oc-state disk " &
-                   fmt"source={homeDir}/.local/state/opencode path=/home/dev/.local/state/opencode shift=true")
+  exitCode = addDiskMounts(containerName)
+  if exitCode != 0:
+    cleanup.run()
+    return ord(ecError)
   
   # Run custom post-create script if provided
   if postCreate.len > 0:
     info("Running post-create script...")
-    discard execCmd(fmt"incus file push {postCreate} {containerName}/tmp/ocdev-post-create.sh")
-    discard execCmd(fmt"incus exec {containerName} -- chmod +x /tmp/ocdev-post-create.sh")
-    
-    exitCode = execCmd(fmt"incus exec {containerName} -- su - dev -c /tmp/ocdev-post-create.sh")
-    if exitCode == 0:
-      discard execCmd(fmt"incus exec {containerName} -- rm -f /tmp/ocdev-post-create.sh")
-    else:
-      warn("Post-create script failed (container kept for debugging)")
-      warn("Script left at /tmp/ocdev-post-create.sh inside container")
-      warn(fmt"Debug with: ocdev shell {name}")
+    discard runPostCreateScript(containerName, name, postCreate)
   
   # Success - save port allocation
   withLockVoid(exclusive = true) do ():
     savePortAllocation(name, port)
   
-  cleanupNeeded = false
+  cleanup.cancel()
   
   let serviceEnd = serviceBase + ServicePortsCount - 1
   success(fmt"Container '{name}' created (SSH: {port}, Services: {serviceBase}-{serviceEnd})")
