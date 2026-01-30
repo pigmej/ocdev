@@ -51,5 +51,7 @@ when isMainModule:
       help = {
         "name": "Target container name",
         "port": "Port to rebind (PORT or CONTAINER_PORT:HOST_PORT)"
-      }]
+      }],
+    [cmdBindings, cmdName = "bindings",
+      doc = "List all dynamic port bindings across containers"]
   )

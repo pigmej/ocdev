@@ -66,8 +66,17 @@ $NIM_BIN bind -n="$TEST_NAME" --list | grep -q "5173"
 echo "Testing rebind (same container)..."
 $NIM_BIN rebind -n="$TEST_NAME" -p=5173
 
+# Test bindings (global view)
+echo "Testing bindings..."
+$NIM_BIN bindings | grep -q "$TEST_NAME"
+$NIM_BIN bindings | grep -q "5173"
+
 # Clean up
 $NIM_BIN unbind -n="$TEST_NAME" -p=5173
+
+# Test bindings shows nothing after cleanup
+echo "Testing bindings empty..."
+! $NIM_BIN bindings | grep -q "$TEST_NAME"
 
 # Test delete
 echo "Testing delete..."

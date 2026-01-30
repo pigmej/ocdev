@@ -98,6 +98,7 @@ ocdev ports
 | `ocdev bind <name> <port> [--list]` | Bind a dynamic port to a container |
 | `ocdev unbind <name> <port>` | Remove a dynamic port binding |
 | `ocdev rebind <name> <port>` | Move a port binding to a different container |
+| `ocdev bindings` | List all dynamic port bindings across containers |
 
 ## How It Works
 
@@ -153,9 +154,17 @@ ocdev unbind myproject 5173
 # Move a binding from one container to another
 # (automatically unbinds from the current owner)
 ocdev rebind otherproject 5173
+
+# See all dynamic bindings across all containers
+ocdev bindings
+# CONTAINER            HOST       CONTAINER      STATUS
+# myproject            5173       5173           RUNNING
+# otherproject         8080       3000           STOPPED
 ```
 
 The `rebind` command is useful when switching between projects — it finds which container currently owns the port, unbinds it, and binds it to the target container in one step. If the port is not bound anywhere, it acts as a regular `bind`.
+
+Use `ocdev bindings` for a global overview of which ports are bound where and whether those containers are running.
 
 ## Firewall Configuration (Recommended)
 

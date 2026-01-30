@@ -850,3 +850,49 @@ proc cmdRebind*(name: string, port: string): int =
       success(fmt"Bound host:{hostPort} -> container:{containerPort} to '{name}'")
 
   result = ord(ecSuccess)
+
+proc cmdBindings*(): int =
+  ## List all dynamic port bindings across all containers
+  ##
+  ## Examples:
+  ##   ocdev bindings
+
+  let prereq = checkPrerequisites()
+  if prereq != 0:
+    return prereq
+
+  # Fetch container names and status in a single call to avoid N+1 subprocess calls
+  let (output, exitCode) = execCmdEx("incus list --format csv -c n,s")
+  if exitCode != 0:
+    error("Failed to list containers")
+    return ord(ecError)
+
+  var found = false
+
+  for line in output.strip().splitLines():
+    let parts = line.strip().split(',')
+    if parts.len < 2:
+      continue
+    let containerName = parts[0]
+    let status = parts[1]
+    if not containerName.startsWith(ContainerPrefix):
+      continue
+
+    let bindings = getDynamicBindings(containerName)
+    if bindings.len == 0:
+      continue
+
+    if not found:
+      echo "CONTAINER".alignLeft(20) & " " & "HOST".alignLeft(10) & " " & "CONTAINER".alignLeft(14) & " STATUS"
+      found = true
+
+    let shortName = containerName[ContainerPrefix.len..^1]
+
+    for binding in bindings:
+      echo shortName.alignLeft(20) & " " & ($binding.hostPort).alignLeft(10) & " " &
+           ($binding.containerPort).alignLeft(14) & " " & status
+
+  if not found:
+    info("No dynamic port bindings")
+
+  result = ord(ecSuccess)
