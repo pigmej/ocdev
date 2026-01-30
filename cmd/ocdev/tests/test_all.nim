@@ -4,6 +4,7 @@ import unittest
 import ../src/container
 import ../src/ports
 import ../src/config
+import ../src/commands
 
 suite "Container name validation":
   test "accepts valid names":
@@ -66,3 +67,52 @@ suite "Constants":
     check ServicePortStart == 2300
     check PortsPerVm == 10
     check ServicePortsCount == 10
+
+suite "Port argument parsing":
+  test "single port sets both container and host port":
+    let result = parsePortArg("8080")
+    check result.valid == true
+    check result.containerPort == 8080
+    check result.hostPort == 8080
+
+  test "colon-separated sets container and host ports":
+    let result = parsePortArg("3000:8080")
+    check result.valid == true
+    check result.containerPort == 3000
+    check result.hostPort == 8080
+
+  test "rejects non-numeric port":
+    check parsePortArg("abc").valid == false
+    check parsePortArg("abc:def").valid == false
+
+  test "rejects zero port":
+    check parsePortArg("0").valid == false
+
+  test "rejects port out of range":
+    check parsePortArg("65536").valid == false
+    check parsePortArg("99999").valid == false
+
+  test "rejects container port out of range":
+    check parsePortArg("65536:80").valid == false
+    check parsePortArg("0:80").valid == false
+
+  test "rejects host port out of range":
+    check parsePortArg("80:65536").valid == false
+    check parsePortArg("80:0").valid == false
+
+  test "rejects malformed colon format":
+    check parsePortArg("80:90:100").valid == false
+
+  test "accepts boundary ports":
+    let low = parsePortArg("1")
+    check low.valid == true
+    check low.containerPort == 1
+    let high = parsePortArg("65535")
+    check high.valid == true
+    check high.containerPort == 65535
+
+  test "accepts boundary ports with colon format":
+    let result = parsePortArg("1:65535")
+    check result.valid == true
+    check result.containerPort == 1
+    check result.hostPort == 65535

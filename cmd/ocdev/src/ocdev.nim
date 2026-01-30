@@ -41,9 +41,15 @@ when isMainModule:
        "list": "List current dynamic port bindings"
      }],
     [cmdUnbind, cmdName = "unbind",
-     doc = "Remove a port binding",
-     help = {
-       "name": "Container name",
-       "port": "Host port to unbind"
-     }]
+      doc = "Remove a port binding",
+      help = {
+        "name": "Container name",
+        "port": "Host port to unbind"
+      }],
+    [cmdRebind, cmdName = "rebind",
+      doc = "Move a port binding to a different container",
+      help = {
+        "name": "Target container name",
+        "port": "Port to rebind (PORT or CONTAINER_PORT:HOST_PORT)"
+      }]
   )

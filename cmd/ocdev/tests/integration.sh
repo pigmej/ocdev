@@ -31,6 +31,44 @@ $NIM_BIN ports | grep -q "$TEST_NAME"
 echo "Testing shell availability..."
 $NIM_BIN shell -n="$TEST_NAME" <<< "exit 0"
 
+# Test bind
+echo "Testing bind..."
+$NIM_BIN bind -n="$TEST_NAME" -p=5173
+$NIM_BIN bind -n="$TEST_NAME" --list | grep -q "5173"
+
+# Test bind with container:host format
+echo "Testing bind with port mapping..."
+$NIM_BIN bind -n="$TEST_NAME" -p=3000:8080
+$NIM_BIN bind -n="$TEST_NAME" --list | grep -q "8080"
+
+# Test bind rejects already-bound port
+echo "Testing bind rejects duplicate..."
+! $NIM_BIN bind -n="$TEST_NAME" -p=5173
+
+# Test unbind
+echo "Testing unbind..."
+$NIM_BIN unbind -n="$TEST_NAME" -p=5173
+! $NIM_BIN bind -n="$TEST_NAME" --list | grep -q "5173"
+
+# Test unbind rejects non-existent binding
+echo "Testing unbind rejects non-existent..."
+! $NIM_BIN unbind -n="$TEST_NAME" -p=5173
+
+# Clean up remaining binding
+$NIM_BIN unbind -n="$TEST_NAME" -p=8080
+
+# Test rebind (fresh bind - port not bound anywhere)
+echo "Testing rebind (fresh)..."
+$NIM_BIN rebind -n="$TEST_NAME" -p=5173
+$NIM_BIN bind -n="$TEST_NAME" --list | grep -q "5173"
+
+# Test rebind (already bound to same container - should be no-op)
+echo "Testing rebind (same container)..."
+$NIM_BIN rebind -n="$TEST_NAME" -p=5173
+
+# Clean up
+$NIM_BIN unbind -n="$TEST_NAME" -p=5173
+
 # Test delete
 echo "Testing delete..."
 $NIM_BIN delete -n="$TEST_NAME"

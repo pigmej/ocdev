@@ -95,6 +95,9 @@ ocdev ports
 | `ocdev ssh <name>` | Show SSH connection info |
 | `ocdev delete <name>` | Remove environment |
 | `ocdev ports` | Show all port mappings |
+| `ocdev bind <name> <port> [--list]` | Bind a dynamic port to a container |
+| `ocdev unbind <name> <port>` | Remove a dynamic port binding |
+| `ocdev rebind <name> <port>` | Move a port binding to a different container |
 
 ## How It Works
 
@@ -129,6 +132,30 @@ Each container gets 11 forwarded ports:
 | n    | 2200+(n-1)*10 | 2300+(n-1)*10 to 2309+(n-1)*10 | nth container |
 
 Service ports are forwarded to the same port inside the container. For example, if your app inside container 1 listens on port 2300, access it from host at `localhost:2300`.
+
+### Dynamic Port Bindings
+
+In addition to the static service ports above, you can dynamically bind any port to a container:
+
+```bash
+# Bind host port 5173 to the same port in the container
+ocdev bind myproject 5173
+
+# Bind host port 8080 to container port 3000
+ocdev bind myproject 3000:8080
+
+# List current dynamic bindings
+ocdev bind myproject --list
+
+# Remove a binding
+ocdev unbind myproject 5173
+
+# Move a binding from one container to another
+# (automatically unbinds from the current owner)
+ocdev rebind otherproject 5173
+```
+
+The `rebind` command is useful when switching between projects — it finds which container currently owns the port, unbinds it, and binds it to the target container in one step. If the port is not bound anywhere, it acts as a regular `bind`.
 
 ## Firewall Configuration (Recommended)
 

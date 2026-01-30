@@ -16,7 +16,7 @@ proc deviceExists(containerName, deviceName: string): bool =
       return true
   return false
 
-proc parsePortArg(portArg: string): tuple[containerPort, hostPort: int, valid: bool, errMsg: string] =
+proc parsePortArg*(portArg: string): tuple[containerPort, hostPort: int, valid: bool, errMsg: string] =
   ## Parse port argument: "PORT" or "CONTAINER_PORT:HOST_PORT"
   ## Returns (containerPort, hostPort, valid, errorMessage)
   if ':' in portArg:
@@ -78,6 +78,21 @@ proc getDynamicBindings(containerName: string): seq[tuple[hostPort, containerPor
           warn(fmt"Unexpected connect format for {deviceName}: {connectStr}")
   
   result = bindings
+
+proc findPortBinding(hostPort: int): string =
+  ## Find which container (if any) has a specific host port dynamically bound.
+  ## Returns full container name (with prefix) or empty string if not found.
+  let (output, exitCode) = execCmdEx("incus list --format csv -c n")
+  if exitCode != 0:
+    return ""
+  let deviceName = fmt"dyn-{hostPort}"
+  for line in output.strip().splitLines():
+    let containerName = line.strip()
+    if not containerName.startsWith(ContainerPrefix):
+      continue
+    if deviceExists(containerName, deviceName):
+      return containerName
+  return ""
 
 proc reconfigureProxyDevices(containerName: string, port: int): int =
   ## Remove inherited proxy devices and add new ones with correct ports
@@ -762,4 +777,76 @@ proc cmdUnbind*(name: string, port: int): int =
     return ord(ecError)
   
   success(fmt"Unbound port {port}")
+  result = ord(ecSuccess)
+
+proc cmdRebind*(name: string, port: string): int =
+  ## Rebind a port to a different container, unbinding from the current owner first
+  ##
+  ## If the port is already bound to another container, it will be unbound first.
+  ## If the port is not bound anywhere, it will simply be bound to the target.
+  ##
+  ## Examples:
+  ##   ocdev rebind myvm 5173           # Move binding of port 5173 to myvm
+  ##   ocdev rebind myvm 3000:8080      # Move host:8080 -> container:3000 to myvm
+
+  let prereq = checkPrerequisites()
+  if prereq != 0:
+    return prereq
+
+  # Validate name before using in shell commands
+  let (nameValid, nameMsg) = validateName(name)
+  if not nameValid:
+    error("Invalid name: " & nameMsg)
+    return ord(ecError)
+
+  if not containerExists(name):
+    error(fmt"Container '{name}' not found")
+    return ord(ecNotFound)
+
+  let (containerPort, hostPort, valid, errMsg) = parsePortArg(port)
+  if not valid:
+    error(errMsg)
+    return ord(ecError)
+
+  let targetContainerName = ContainerPrefix & name
+  let deviceName = fmt"dyn-{hostPort}"
+
+  # Check if already bound to the target container
+  if deviceExists(targetContainerName, deviceName):
+    info(fmt"Port {hostPort} is already bound to '{name}'")
+    return ord(ecSuccess)
+
+  # Find which container currently has this port bound
+  let currentOwner = findPortBinding(hostPort)
+
+  if currentOwner.len > 0:
+    # Unbind from current owner
+    let shortName = currentOwner[ContainerPrefix.len..^1]
+    info(fmt"Unbinding port {hostPort} from '{shortName}'")
+    let unbindCode = execCmd(fmt"incus config device remove {currentOwner} {deviceName}")
+    if unbindCode != 0:
+      error(fmt"Failed to unbind port {hostPort} from '{shortName}'")
+      return ord(ecError)
+
+  # Bind to target container
+  # NOTE: Listens on 0.0.0.0 (all interfaces) to match cmdBind behavior.
+  # If the host is exposed to untrusted networks, consider restricting to 127.0.0.1.
+  let exitCode = execCmd(fmt"incus config device add {targetContainerName} {deviceName} proxy " &
+                         fmt"listen=tcp:0.0.0.0:{hostPort} connect=tcp:127.0.0.1:{containerPort} bind=host")
+  if exitCode != 0:
+    error(fmt"Failed to bind port {hostPort} to '{name}'")
+    return ord(ecError)
+
+  if currentOwner.len > 0:
+    let shortName = currentOwner[ContainerPrefix.len..^1]
+    if containerPort == hostPort:
+      success(fmt"Rebound port {hostPort} from '{shortName}' to '{name}'")
+    else:
+      success(fmt"Rebound host:{hostPort} -> container:{containerPort} from '{shortName}' to '{name}'")
+  else:
+    if containerPort == hostPort:
+      success(fmt"Bound port {hostPort} to '{name}'")
+    else:
+      success(fmt"Bound host:{hostPort} -> container:{containerPort} to '{name}'")
+
   result = ord(ecSuccess)
