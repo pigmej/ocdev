@@ -851,6 +851,156 @@ proc cmdRebind*(name: string, port: string): int =
 
   result = ord(ecSuccess)
 
+proc cmdExport*(name: string, snapshot: string, output = ""): int =
+  ## Export a container snapshot as a portable tarball
+  ##
+  ## Publishes the snapshot as a temporary local image, exports it to
+  ## a tarball file, then cleans up the temp image. The resulting file
+  ## can be transferred to another server and imported with 'ocdev import'.
+  ##
+  ## Examples:
+  ##   ocdev export myvm --snapshot snap0
+  ##   ocdev export myvm --snapshot snap0 --output /tmp/myvm.tar.gz
+
+  let prereq = checkPrerequisites()
+  if prereq != 0:
+    return prereq
+
+  if not containerExists(name):
+    error(fmt"Container '{name}' not found")
+    return ord(ecNotFound)
+
+  let containerName = ContainerPrefix & name
+
+  # Validate snapshot exists
+  if not snapshotExists(name, snapshot):
+    error(fmt"Snapshot '{snapshot}' not found on container '{name}'")
+    return ord(ecNotFound)
+
+  # Determine output path
+  let outputPath = if output.len > 0: output
+                   else: getCurrentDir() / fmt"{name}-{snapshot}.tar.gz"
+
+  # Temp image alias (unique to avoid collisions)
+  let tempAlias = fmt"ocdev-export-{name}-{snapshot}"
+
+  # Publish snapshot as image
+  info(fmt"Publishing snapshot '{snapshot}' as temporary image...")
+  var exitCode = execCmd(fmt"incus publish {containerName}/{snapshot} --alias {tempAlias}")
+  if exitCode != 0:
+    error("Failed to publish snapshot as image")
+    return ord(ecError)
+
+  # Export image to file
+  info(fmt"Exporting image to {outputPath}...")
+  exitCode = execCmd(fmt"incus image export {tempAlias} {outputPath}")
+
+  # Clean up temp image regardless of export result
+  discard execCmd(fmt"incus image delete {tempAlias}")
+
+  if exitCode != 0:
+    error("Failed to export image to file")
+    return ord(ecError)
+
+  success(fmt"Exported {name}/{snapshot} to {outputPath}")
+  info("Transfer this file to another server and use 'ocdev import' to restore.")
+  result = ord(ecSuccess)
+
+proc cmdImport*(name: string, file: string): int =
+  ## Import a container from an exported tarball
+  ##
+  ## Imports the tarball as a temporary image, creates a container from it,
+  ## configures ports and disk mounts, then cleans up the temp image.
+  ##
+  ## Examples:
+  ##   ocdev import myvm --file /tmp/myvm.tar.gz
+
+  let prereq = checkPrerequisites()
+  if prereq != 0:
+    return prereq
+
+  # Validate name
+  let (valid, msg) = validateName(name)
+  if not valid:
+    error("Invalid name: " & msg)
+    return ord(ecError)
+
+  # Check file exists
+  if not fileExists(file):
+    error(fmt"File not found: {file}")
+    return ord(ecError)
+
+  # Check container doesn't already exist
+  if containerExists(name):
+    error("Container '" & name & "' already exists")
+    return ord(ecError)
+
+  let containerName = ContainerPrefix & name
+
+  # Temp image alias
+  let tempAlias = fmt"ocdev-import-{name}"
+
+  # Import image from tarball
+  info(fmt"Importing image from {file}...")
+  var exitCode = execCmd(fmt"incus image import {file} --alias {tempAlias}")
+  if exitCode != 0:
+    error("Failed to import image from file")
+    return ord(ecError)
+
+  # Allocate port
+  let (port, portErr) = allocatePortSafe()
+  if portErr.len > 0:
+    discard execCmd(fmt"incus image delete {tempAlias}")
+    error(portErr)
+    return ord(ecError)
+
+  # Ensure profile exists
+  ensureProfile()
+
+  # Launch container from imported image
+  info("Creating container from imported image...")
+  exitCode = execCmd(fmt"incus launch {tempAlias} {containerName} --profile default --profile {ProfileName}")
+  if exitCode != 0:
+    # Try without profiles (the image may already have the config baked in)
+    exitCode = execCmd(fmt"incus launch {tempAlias} {containerName}")
+    if exitCode != 0:
+      discard execCmd(fmt"incus image delete {tempAlias}")
+      error("Failed to create container from imported image")
+      return ord(ecError)
+
+  # Clean up temp image
+  discard execCmd(fmt"incus image delete {tempAlias}")
+
+  var cleanup = initCleanup(containerName)
+
+  # Reconfigure proxy devices with fresh ports
+  info(fmt"Configuring ports (SSH: {port})...")
+  exitCode = reconfigureProxyDevices(containerName, port)
+  if exitCode != 0:
+    # If reconfigure fails, it may be a fresh image with no inherited devices - try adding directly
+    exitCode = addProxyDevices(containerName, port)
+    if exitCode != 0:
+      cleanup.run()
+      return ord(ecError)
+
+  # Add disk mounts
+  info("Configuring disk mounts...")
+  exitCode = addDiskMounts(containerName)
+  if exitCode != 0:
+    cleanup.run()
+    return ord(ecError)
+
+  # Save port allocation
+  withLockVoid(exclusive = true) do ():
+    savePortAllocation(name, port)
+
+  cleanup.cancel()
+
+  let serviceBase = getServicePortBase(port)
+  let serviceEnd = serviceBase + ServicePortsCount - 1
+  success(fmt"Container '{name}' imported (SSH: {port}, Services: {serviceBase}-{serviceEnd})")
+  result = ord(ecSuccess)
+
 proc cmdBindings*(): int =
   ## List all dynamic port bindings across all containers
   ##

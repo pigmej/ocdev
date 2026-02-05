@@ -53,5 +53,18 @@ when isMainModule:
         "port": "Port to rebind (PORT or CONTAINER_PORT:HOST_PORT)"
       }],
     [cmdBindings, cmdName = "bindings",
-      doc = "List all dynamic port bindings across containers"]
+       doc = "List all dynamic port bindings across containers"],
+    [cmdExport, cmdName = "export",
+       doc = "Export a container snapshot as a portable tarball",
+       help = {
+         "name": "Container name",
+         "snapshot": "Snapshot name to export",
+         "output": "Output file path (default: ./<name>-<snapshot>.tar.gz)"
+       }],
+    [cmdImport, cmdName = "import",
+       doc = "Import a container from an exported tarball",
+       help = {
+         "name": "Name for the new container",
+         "file": "Path to the exported tarball"
+       }]
   )
