@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build linux-amd64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: make dev-setup
+
+      - name: Build release binary
+        run: make
+
+      - name: Strip binary
+        run: strip bin/ocdev
+
+      - name: Size check
+        run: make size-check
+
+      - name: Package artifact
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          artifact="ocdev-${tag}-linux-amd64.tar.gz"
+          tar -czf "${artifact}" -C bin ocdev
+          sha256sum "${artifact}" > "${artifact}.sha256"
+          echo "ARTIFACT=${artifact}" >> "$GITHUB_ENV"
+          echo "TAG=${tag}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocdev-linux-amd64
+          path: |
+            ocdev-*.tar.gz
+            ocdev-*.tar.gz.sha256
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          prev_tag=$(git tag --sort=-v:refname | grep -A1 "^${tag}$" | tail -1)
+          if [ -n "${prev_tag}" ] && [ "${prev_tag}" != "${tag}" ]; then
+            echo "Generating changelog from ${prev_tag} to ${tag}"
+            {
+              echo "NOTES<<EOF"
+              echo "## Changes"
+              echo ""
+              git log --pretty=format:"- %s (%h)" "${prev_tag}..${tag}"
+              echo ""
+              echo ""
+              echo "## Checksums"
+              echo '```'
+              cat artifacts/*.sha256
+              echo '```'
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "NOTES<<EOF"
+              echo "## Initial Release"
+              echo ""
+              echo "## Checksums"
+              echo '```'
+              cat artifacts/*.sha256
+              echo '```'
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.notes.outputs.NOTES }}
+          files: |
+            artifacts/ocdev-*.tar.gz
+            artifacts/ocdev-*.tar.gz.sha256
+          generate_release_notes: false
