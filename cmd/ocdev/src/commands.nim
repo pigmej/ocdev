@@ -851,66 +851,59 @@ proc cmdRebind*(name: string, port: string): int =
 
   result = ord(ecSuccess)
 
-proc cmdExport*(name: string, snapshot: string, output = ""): int =
-  ## Export a container snapshot as a portable tarball
+proc cmdExport*(name: string, output = ""): int =
+  ## Export a container as a portable tarball
   ##
-  ## Publishes the snapshot as a temporary local image, exports it to
-  ## a tarball file, then cleans up the temp image. The resulting file
-  ## can be transferred to another server and imported with 'ocdev import'.
+  ## Creates a full backup of the container using 'incus export'.
+  ## The container must be stopped before exporting.
+  ## The resulting file can be transferred to another server and
+  ## imported with 'ocdev import'.
   ##
   ## Examples:
-  ##   ocdev export myvm --snapshot snap0
-  ##   ocdev export myvm --snapshot snap0 --output /tmp/myvm.tar.gz
+  ##   ocdev export myvm
+  ##   ocdev export myvm --output /tmp/myvm.tar.gz
 
   let prereq = checkPrerequisites()
   if prereq != 0:
     return prereq
 
+  # Validate name
+  let (valid, msg) = validateName(name)
+  if not valid:
+    error("Invalid name: " & msg)
+    return ord(ecError)
+
   if not containerExists(name):
     error(fmt"Container '{name}' not found")
     return ord(ecNotFound)
 
-  let containerName = ContainerPrefix & name
+  if containerRunning(name):
+    error(fmt"Container '{name}' is running. Stop it first with 'ocdev stop {name}'.")
+    return ord(ecError)
 
-  # Validate snapshot exists
-  if not snapshotExists(name, snapshot):
-    error(fmt"Snapshot '{snapshot}' not found on container '{name}'")
-    return ord(ecNotFound)
+  let containerName = ContainerPrefix & name
 
   # Determine output path
   let outputPath = if output.len > 0: output
-                   else: getCurrentDir() / fmt"{name}-{snapshot}.tar.gz"
+                   else: getCurrentDir() / fmt"{name}.tar.gz"
 
-  # Temp image alias (unique to avoid collisions)
-  let tempAlias = fmt"ocdev-export-{name}-{snapshot}"
-
-  # Publish snapshot as image
-  info(fmt"Publishing snapshot '{snapshot}' as temporary image...")
-  var exitCode = execCmd(fmt"incus publish {containerName}/{snapshot} --alias {tempAlias}")
+  # Export container directly (full backup including rootfs)
+  info(fmt"Exporting container '{name}'...")
+  let exitCode = execCmd(fmt"incus export {containerName} {quoteShell(outputPath)} --instance-only")
   if exitCode != 0:
-    error("Failed to publish snapshot as image")
+    error("Failed to export container")
     return ord(ecError)
 
-  # Export image to file
-  info(fmt"Exporting image to {outputPath}...")
-  exitCode = execCmd(fmt"incus image export {tempAlias} {outputPath}")
-
-  # Clean up temp image regardless of export result
-  discard execCmd(fmt"incus image delete {tempAlias}")
-
-  if exitCode != 0:
-    error("Failed to export image to file")
-    return ord(ecError)
-
-  success(fmt"Exported {name}/{snapshot} to {outputPath}")
+  success(fmt"Exported '{name}' to {outputPath}")
   info("Transfer this file to another server and use 'ocdev import' to restore.")
   result = ord(ecSuccess)
 
 proc cmdImport*(name: string, file: string): int =
   ## Import a container from an exported tarball
   ##
-  ## Imports the tarball as a temporary image, creates a container from it,
-  ## configures ports and disk mounts, then cleans up the temp image.
+  ## Imports the tarball using 'incus import' which preserves the full
+  ## container filesystem. Then reconfigures ports and disk mounts for
+  ## the new host.
   ##
   ## Examples:
   ##   ocdev import myvm --file /tmp/myvm.tar.gz
@@ -937,56 +930,57 @@ proc cmdImport*(name: string, file: string): int =
 
   let containerName = ContainerPrefix & name
 
-  # Temp image alias
-  let tempAlias = fmt"ocdev-import-{name}"
-
-  # Import image from tarball
-  info(fmt"Importing image from {file}...")
-  var exitCode = execCmd(fmt"incus image import {file} --alias {tempAlias}")
-  if exitCode != 0:
-    error("Failed to import image from file")
-    return ord(ecError)
+  # Ensure profile exists
+  ensureProfile()
 
   # Allocate port
   let (port, portErr) = allocatePortSafe()
   if portErr.len > 0:
-    discard execCmd(fmt"incus image delete {tempAlias}")
     error(portErr)
     return ord(ecError)
 
-  # Ensure profile exists
-  ensureProfile()
-
-  # Launch container from imported image
-  info("Creating container from imported image...")
-  exitCode = execCmd(fmt"incus launch {tempAlias} {containerName} --profile default --profile {ProfileName}")
+  # Import container from backup tarball
+  info(fmt"Importing container from {file}...")
+  var exitCode = execCmd(fmt"incus import {quoteShell(file)} {containerName}")
   if exitCode != 0:
-    # Try without profiles (the image may already have the config baked in)
-    exitCode = execCmd(fmt"incus launch {tempAlias} {containerName}")
-    if exitCode != 0:
-      discard execCmd(fmt"incus image delete {tempAlias}")
-      error("Failed to create container from imported image")
-      return ord(ecError)
-
-  # Clean up temp image
-  discard execCmd(fmt"incus image delete {tempAlias}")
+    error("Failed to import container from file")
+    return ord(ecError)
 
   var cleanup = initCleanup(containerName)
 
-  # Reconfigure proxy devices with fresh ports
+  # Reconfigure proxy devices with fresh ports (remove old, add new)
   info(fmt"Configuring ports (SSH: {port})...")
   exitCode = reconfigureProxyDevices(containerName, port)
   if exitCode != 0:
-    # If reconfigure fails, it may be a fresh image with no inherited devices - try adding directly
+    # If reconfigure fails, try adding directly (container may have no inherited devices)
     exitCode = addProxyDevices(containerName, port)
     if exitCode != 0:
       cleanup.run()
       return ord(ecError)
 
-  # Add disk mounts
+  # Remove inherited disk mounts (source paths won't match on new host)
+  # and add fresh ones pointing to the current host's home directory
   info("Configuring disk mounts...")
+  let diskDevices = @["host-config", "host-opencode", "host-ssh",
+                      "host-gitconfig", "host-oc-share", "host-oc-state"]
+  for device in diskDevices:
+    if deviceExists(containerName, device):
+      discard execCmd(fmt"incus config device remove {containerName} {device}")
+
   exitCode = addDiskMounts(containerName)
   if exitCode != 0:
+    cleanup.run()
+    return ord(ecError)
+
+  # Clear volatile config (MAC address, etc.) to avoid conflicts on new host
+  discard execCmd(fmt"incus config unset {containerName} volatile.eth0.hwaddr")
+  discard execCmd(fmt"incus config unset {containerName} volatile.eth0.host_name")
+
+  # Start container
+  info("Starting container...")
+  exitCode = execCmd(fmt"incus start {containerName}")
+  if exitCode != 0:
+    error("Failed to start container")
     cleanup.run()
     return ord(ecError)
 

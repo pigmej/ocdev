@@ -55,11 +55,10 @@ when isMainModule:
     [cmdBindings, cmdName = "bindings",
        doc = "List all dynamic port bindings across containers"],
     [cmdExport, cmdName = "export",
-       doc = "Export a container snapshot as a portable tarball",
+       doc = "Export a container as a portable tarball",
        help = {
-         "name": "Container name",
-         "snapshot": "Snapshot name to export",
-         "output": "Output file path (default: ./<name>-<snapshot>.tar.gz)"
+         "name": "Container name (must be stopped)",
+         "output": "Output file path (default: ./<name>.tar.gz)"
        }],
     [cmdImport, cmdName = "import",
        doc = "Import a container from an exported tarball",
