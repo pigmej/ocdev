@@ -1,4 +1,4 @@
-version       = "0.1.1"
+version       = "0.1.2"
 author        = "Jedrzej Nowak (pigmej)"
 description   = "Manage isolated development environments using Incus containers"
 license       = "MIT"

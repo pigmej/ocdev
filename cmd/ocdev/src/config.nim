@@ -2,7 +2,7 @@
 import std/os
 
 const
-  Version* = "0.1.1"
+  Version* = "0.1.2"
   ContainerPrefix* = "ocdev-"
   ProfileName* = "ocdev"
   BaseImage* = "images:ubuntu/25.10"
