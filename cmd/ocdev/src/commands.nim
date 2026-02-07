@@ -855,9 +855,12 @@ proc cmdExport*(name: string, output = ""): int =
   ## Export a container as a portable tarball
   ##
   ## Creates a full backup of the container using 'incus export'.
-  ## The container must be stopped before exporting.
   ## The resulting file can be transferred to another server and
   ## imported with 'ocdev import'.
+  ##
+  ## Works on both running and stopped containers. For maximum
+  ## consistency, stop the container first, but for dev environments
+  ## exporting while running is fine.
   ##
   ## Examples:
   ##   ocdev export myvm
@@ -878,8 +881,7 @@ proc cmdExport*(name: string, output = ""): int =
     return ord(ecNotFound)
 
   if containerRunning(name):
-    error(fmt"Container '{name}' is running. Stop it first with 'ocdev stop {name}'.")
-    return ord(ecError)
+    warn("Container is running. Export will proceed but filesystem may not be fully consistent.")
 
   let containerName = ContainerPrefix & name
 
