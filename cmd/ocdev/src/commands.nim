@@ -889,9 +889,34 @@ proc cmdExport*(name: string, output = ""): int =
   let outputPath = if output.len > 0: output
                    else: getCurrentDir() / fmt"{name}.tar.gz"
 
-  # Export container directly (full backup including rootfs)
+  # Temporarily remove host-specific devices (disk mounts, proxy ports)
+  # so the backup doesn't contain paths/ports tied to this host.
+  # We'll restore them after export.
+  let diskDevices = @["host-config", "host-opencode", "host-ssh",
+                      "host-gitconfig", "host-oc-share", "host-oc-state"]
+  let proxyDevices = @["ssh-proxy", "svc-proxy-0", "svc-proxy-1",
+                       "svc-proxy-2", "svc-proxy-3", "svc-proxy-4",
+                       "svc-proxy-5", "svc-proxy-6", "svc-proxy-7",
+                       "svc-proxy-8", "svc-proxy-9"]
+
+  info("Stripping host-specific devices before export...")
+  for device in diskDevices & proxyDevices:
+    if deviceExists(containerName, device):
+      discard execCmd(fmt"incus config device remove {containerName} {device}")
+
+  # Export container (full backup including rootfs, without host-specific devices)
   info(fmt"Exporting container '{name}'...")
   let exitCode = execCmd(fmt"incus export {containerName} {quoteShell(outputPath)} --instance-only")
+
+  # Restore devices regardless of export result
+  info("Restoring host-specific devices...")
+  let port = getPort(name)
+  if port > 0:
+    if addProxyDevices(containerName, port) != 0:
+      warn("Failed to restore some proxy devices")
+  if addDiskMounts(containerName) != 0:
+    warn("Failed to restore some disk mounts")
+
   if exitCode != 0:
     error("Failed to export container")
     return ord(ecError)
