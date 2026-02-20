@@ -99,6 +99,8 @@ ocdev ports
 | `ocdev unbind <name> <port>` | Remove a dynamic port binding |
 | `ocdev rebind <name> <port>` | Move a port binding to a different container |
 | `ocdev bindings` | List all dynamic port bindings across containers |
+| `ocdev export <name> [--output <path>]` | Export container as portable tarball |
+| `ocdev import <name> --file <path>` | Import container from exported tarball |
 
 ## How It Works
 
