@@ -29,7 +29,7 @@ when isMainModule:
       "version": noVer,
       "name": "Container name (alphanumeric and hyphens, max 50 chars)",
       "postCreate": "Script to run after container creation",
-      "from": "Create from existing container or snapshot (format: container or container/snapshot)"
+      "from": "Clone from container or snapshot (format: container or container/snapshot; use snapshot for a stable point-in-time copy)"
      }],
     [cmdList, cmdName = "list",
      doc = "List all ocdev containers",
