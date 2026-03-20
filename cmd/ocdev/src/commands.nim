@@ -40,6 +40,39 @@ proc parsePortArg*(portArg: string): tuple[containerPort, hostPort: int, valid: 
       return (0, 0, false, fmt"Port must be between {MinPort} and {MaxPort}")
     return (port, port, true, "")
 
+type
+  CloneSourceKind* = enum
+    cskContainer,
+    cskSnapshot
+  CloneSource* = object
+    kind*: CloneSourceKind
+    container*: string
+    snapshot*: string
+
+proc parseCloneSource*(`from`: string): tuple[source: CloneSource, valid: bool, errMsg: string] =
+  ## Parse clone source: "container" or "container/snapshot"
+  if `from`.len == 0:
+    return (CloneSource(), false, "Invalid clone source. Use: container or container/snapshot")
+
+  let parts = `from`.split('/')
+  if parts.len < 1 or parts.len > 2:
+    return (CloneSource(), false, "Invalid clone source. Use: container or container/snapshot")
+
+  let container = parts[0]
+  let snapshot = if parts.len == 2: parts[1] else: ""
+  if container.len == 0 or (parts.len == 2 and snapshot.len == 0):
+    return (CloneSource(), false, "Invalid clone source. Use: container or container/snapshot")
+
+  let (containerValid, containerMsg) = validateName(container)
+  if not containerValid:
+    return (CloneSource(), false, "Invalid source container name: " & containerMsg)
+
+  if parts.len == 1:
+    return (CloneSource(kind: cskContainer, container: container), true, "")
+
+  return (CloneSource(kind: cskSnapshot, container: container, snapshot: snapshot), true, "")
+
+
 const
   DynDevicePrefix = "dyn-"
   TcpConnectPrefix = "tcp:127.0.0.1:"
@@ -283,7 +316,7 @@ proc checkPrerequisites(): int =
   
   result = ord(ecSuccess)
 
-proc cmdCreate*(name: string, postCreate = "", fromSnapshot = ""): int =
+proc cmdCreate*(name: string, postCreate = "", `from` = ""): int =
   ## Create a new development container
   ## 
   ## Creates an Incus container with:
@@ -316,79 +349,77 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = ""): int =
   
   let containerName = ContainerPrefix & name
   
-  # Handle snapshot clone flow
-  if fromSnapshot.len > 0:
-    # Parse fromSnapshot (format: container/snapshot)
-    let snapshotParts = fromSnapshot.split('/')
-    if snapshotParts.len != 2:
-      error("Invalid snapshot format. Use: container/snapshot")
+  if `from`.len > 0:
+    let (cloneSource, cloneValid, cloneErr) = parseCloneSource(`from`)
+    if not cloneValid:
+      error(cloneErr)
       return ord(ecError)
-    
-    let sourceContainer = snapshotParts[0]
-    let snapshotName = snapshotParts[1]
-    
-    # Validate source container exists
-    if not containerExists(sourceContainer):
-      error(fmt"Source container '{sourceContainer}' not found")
+
+    if not containerExists(cloneSource.container):
+      error(fmt"Source container '{cloneSource.container}' not found")
       return ord(ecNotFound)
-    
-    # Validate snapshot exists
-    if not snapshotExists(sourceContainer, snapshotName):
-      error(fmt"Snapshot '{snapshotName}' not found on container '{sourceContainer}'")
-      return ord(ecNotFound)
-    
+
+    if cloneSource.kind == cskSnapshot:
+      if not snapshotExists(cloneSource.container, cloneSource.snapshot):
+        error(fmt"Snapshot '{cloneSource.snapshot}' not found on container '{cloneSource.container}'")
+        return ord(ecNotFound)
+    elif containerRunning(cloneSource.container):
+      warn("Source container is running. Clone will proceed while the source stays running, but in-flight filesystem changes may not be fully consistent.")
+
     # Check destination doesn't exist
     if containerExists(name):
       error("Container '" & name & "' already exists")
       return ord(ecError)
-    
+
     # Allocate port
     let (port, portErr) = allocatePortSafe()
     if portErr.len > 0:
       error(portErr)
       return ord(ecError)
-    
+
     var cleanup = initCleanup(containerName)
-    
-    let sourceFullName = ContainerPrefix & sourceContainer
-    info(fmt"Cloning container from {sourceContainer}/{snapshotName}...")
-    
-    # Clone from snapshot
-    var exitCode = execCmd(fmt"incus copy {sourceFullName}/{snapshotName} {containerName}")
+
+    let sourceFullName = ContainerPrefix & cloneSource.container
+    let sourceRef = if cloneSource.kind == cskSnapshot: sourceFullName & "/" & cloneSource.snapshot else: sourceFullName
+    let sourceDisplay = if cloneSource.kind == cskSnapshot: cloneSource.container & "/" & cloneSource.snapshot else: cloneSource.container
+    info(fmt"Cloning container from {sourceDisplay}...")
+
+    var exitCode = execCmd("incus copy " & quoteShell(sourceRef) & " " & quoteShell(containerName))
     if exitCode != 0:
-      error("Failed to clone from snapshot")
+      let cloneFailure = if cloneSource.kind == cskSnapshot: "Failed to clone from snapshot" else: "Failed to clone from container"
+      error(cloneFailure)
       cleanup.run()
       return ord(ecError)
-    
+
     # Reconfigure proxy devices with new ports
     info(fmt"Configuring ports (SSH: {port})...")
     exitCode = reconfigureProxyDevices(containerName, port)
     if exitCode != 0:
       cleanup.run()
       return ord(ecError)
-    
+
     # Start container
     info("Starting container...")
-    exitCode = execCmd(fmt"incus start {containerName}")
+    exitCode = execCmd("incus start " & quoteShell(containerName))
     if exitCode != 0:
       error("Failed to start container")
       cleanup.run()
       return ord(ecError)
-    
+
     # Run custom post-create script if provided
     if postCreate.len > 0:
       info("Running post-create script...")
       discard runPostCreateScript(containerName, name, postCreate)
-    
+
     # Success - save port allocation
     withLockVoid(exclusive = true) do ():
       savePortAllocation(name, port)
-    
+
     cleanup.cancel()
-    
+
     let serviceBase = getServicePortBase(port)
     let serviceEnd = serviceBase + ServicePortsCount - 1
-    success(fmt"Container '{name}' created from snapshot (SSH: {port}, Services: {serviceBase}-{serviceEnd})")
+    success(fmt"Container '{name}' created from {sourceDisplay} (SSH: {port}, Services: {serviceBase}-{serviceEnd})")
     return ord(ecSuccess)
   
   # Check container doesn't already exist

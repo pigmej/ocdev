@@ -54,8 +54,8 @@ ocdev create myproject
 # Create with a custom setup script
 ocdev create myproject --post-create ~/dotfiles/dev-setup.sh
 
-# Create from an existing container's snapshot
-ocdev create myproject-clone --from-snapshot myproject/initial
+# Clone an existing environment (source stays running; in-flight filesystem changes may not be fully consistent)
+ocdev create myproject-clone --from myproject
 
 # List all environments
 ocdev list
@@ -87,7 +87,7 @@ ocdev ports
 
 | Command | Description |
 |---------|-------------|
-| `ocdev create <name> [--post-create <script>] [--from-snapshot <container/snapshot>]` | Create new dev environment |
+| `ocdev create <name> [--post-create <script>] [--from <container[/snapshot]>]` | Create new dev environment |
 | `ocdev list` | List all dev environments |
 | `ocdev start <name>` | Start a stopped environment |
 | `ocdev stop <name>` | Stop a running environment |
@@ -204,25 +204,35 @@ sudo ufw status numbered
 | `~/.ssh` | `/home/dev/.ssh` | read-only |
 | `~/.gitconfig` | `/home/dev/.gitconfig` | read-only |
 
-## Creating from Snapshots
+## Cloning Existing Environments
 
-Clone a container from an existing snapshot using `--from-snapshot`:
+Use `--from` to clone an existing environment. It accepts either `container` for a live clone or `container/snapshot` for a snapshot clone.
+
+Live clone an environment from its current container state:
+
+```bash
+# Clone from the current container state
+ocdev create myproject-clone --from myproject
+```
+
+This works whether the source environment is running or stopped. If the source container is running, `ocdev` clones it while leaving the source up, but in-flight filesystem changes may not be fully consistent in the clone.
+
+Clone from a specific snapshot when you want a named, stable point-in-time source:
 
 ```bash
 # First, create a snapshot of an existing container
 incus snapshot create ocdev-myproject initial
 
 # Then create a new container from that snapshot
-ocdev create myproject-clone --from-snapshot myproject/initial
+ocdev create myproject-clone --from myproject/initial
 ```
 
-The format is `container/snapshot` (without the `ocdev-` prefix). The cloned container:
+In both forms, the cloned environment:
 - Gets new SSH and service port assignments (no port conflicts)
-- Inherits all installed software and configuration from the snapshot
-- Disk mounts are preserved from the source container
+- Does not inherit proxy devices or dynamic port bindings from the source
+- Keeps the same local host directory mounts as the source container
 
-This is useful for quickly spinning up pre-configured environments.
-
+Use a live clone for fast local duplication, or a snapshot clone when you need a deliberate point-in-time base.
 ## Custom Setup Scripts
 
 Run a custom script after container provisioning using `--post-create`:

@@ -116,3 +116,35 @@ suite "Port argument parsing":
     check result.valid == true
     check result.containerPort == 1
     check result.hostPort == 65535
+
+
+suite "Clone source parsing":
+  test "parses live container source":
+    let result = parseCloneSource("existing-env")
+    check result.valid == true
+    check result.source.kind == cskContainer
+    check result.source.container == "existing-env"
+    check result.source.snapshot == ""
+
+  test "parses snapshot source":
+    let result = parseCloneSource("existing-env/snap0")
+    check result.valid == true
+    check result.source.kind == cskSnapshot
+    check result.source.container == "existing-env"
+    check result.source.snapshot == "snap0"
+
+  test "rejects malformed clone sources":
+    for value in @["", "/snapshot", "container/", "container/snapshot/extra"]:
+      let result = parseCloneSource(value)
+      check result.valid == false
+      check result.errMsg == "Invalid clone source. Use: container or container/snapshot"
+
+  test "rejects invalid source container names":
+    let result = parseCloneSource("123bad")
+    check result.valid == false
+    check result.errMsg == "Invalid source container name: Name must start with a letter"
+
+  test "treats live and snapshot sources differently":
+    let liveSource = parseCloneSource("existing-env")
+    let snapshotSource = parseCloneSource("existing-env/snap0")
+    check liveSource.source.kind != snapshotSource.source.kind
