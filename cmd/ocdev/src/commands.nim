@@ -266,6 +266,27 @@ proc addDiskMounts(containerName: string): int =
     if exitCode != 0:
       error("Failed to mount ~/.opencode")
       return exitCode
+
+  if dirExists(homeDir / ".claude"):
+    let exitCode = execCmd(fmt"incus config device add {containerName} host-claude disk " &
+                           fmt"source={homeDir}/.claude path=/home/dev/.claude shift=true")
+    if exitCode != 0:
+      error("Failed to mount ~/.claude")
+      return exitCode
+
+  if dirExists(homeDir / ".codex"):
+    let exitCode = execCmd(fmt"incus config device add {containerName} host-codex disk " &
+                           fmt"source={homeDir}/.codex path=/home/dev/.codex shift=true")
+    if exitCode != 0:
+      error("Failed to mount ~/.codex")
+      return exitCode
+
+  if dirExists(homeDir / ".omp"):
+    let exitCode = execCmd(fmt"incus config device add {containerName} host-omp disk " &
+                           fmt"source={homeDir}/.omp path=/home/dev/.omp shift=true")
+    if exitCode != 0:
+      error("Failed to mount ~/.omp")
+      return exitCode
   
   if dirExists(homeDir / ".ssh"):
     let exitCode = execCmd(fmt"incus config device add {containerName} host-ssh disk " &
@@ -322,7 +343,7 @@ proc cmdCreate*(name: string, postCreate = "", `from` = ""): int =
   ## Creates an Incus container with:
   ## - SSH access on allocated port (2200, 2210, 2220, ...)
   ## - Service ports (10 ports starting at corresponding 2300+)
-  ## - Host directory mounts (~/.config, ~/.ssh, ~/.opencode, ~/.gitconfig)
+  ## - Host directory mounts (~/.config, ~/.opencode, ~/.claude, ~/.codex, ~/.omp, ~/.ssh, ~/.gitconfig)
   ## - Docker-in-container support
   ## - Dev user with matching UID and passwordless sudo
   
@@ -923,7 +944,7 @@ proc cmdExport*(name: string, output = ""): int =
   # Temporarily remove host-specific devices (disk mounts, proxy ports)
   # so the backup doesn't contain paths/ports tied to this host.
   # We'll restore them after export.
-  let diskDevices = @["host-config", "host-opencode", "host-ssh",
+  let diskDevices = @["host-config", "host-opencode", "host-claude", "host-codex", "host-omp", "host-ssh",
                       "host-gitconfig", "host-oc-share", "host-oc-state"]
   let proxyDevices = @["ssh-proxy", "svc-proxy-0", "svc-proxy-1",
                        "svc-proxy-2", "svc-proxy-3", "svc-proxy-4",
@@ -1019,7 +1040,7 @@ proc cmdImport*(name: string, file: string): int =
   # Remove inherited disk mounts (source paths won't match on new host)
   # and add fresh ones pointing to the current host's home directory
   info("Configuring disk mounts...")
-  let diskDevices = @["host-config", "host-opencode", "host-ssh",
+  let diskDevices = @["host-config", "host-opencode", "host-claude", "host-codex", "host-omp", "host-ssh",
                       "host-gitconfig", "host-oc-share", "host-oc-state"]
   for device in diskDevices:
     if deviceExists(containerName, device):
