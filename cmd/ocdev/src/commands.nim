@@ -297,6 +297,25 @@ proc addDiskMounts(containerName: string): int =
   
   result = 0
 
+proc setContainerHostname(containerName, hostname: string): int =
+  ## Set and verify the guest hostname for a container
+  var exitCode = execCmd(fmt"incus exec {quoteShell(containerName)} -- hostnamectl set-hostname {quoteShell(hostname)}")
+  if exitCode != 0:
+    error(fmt"Failed to set container hostname to '{hostname}'")
+    return exitCode
+
+  let (hostnameOutput, verifyExit) = execCmdEx(fmt"incus exec {quoteShell(containerName)} -- hostname")
+  if verifyExit != 0:
+    error("Failed to verify container hostname")
+    return verifyExit
+
+  let currentHostname = hostnameOutput.strip()
+  if currentHostname != hostname:
+    error(fmt"Container hostname verification failed (expected '{hostname}', got '{currentHostname}')")
+    return 1
+
+  result = 0
+
 proc checkPrerequisites(): int =
   ## Check incus command and group membership
   let (_, exitCode) = execCmdEx("command -v incus")
@@ -1039,6 +1058,13 @@ proc cmdImport*(name: string, file: string): int =
   exitCode = execCmd(fmt"incus start {containerName}")
   if exitCode != 0:
     error("Failed to start container")
+    cleanup.run()
+    return ord(ecError)
+
+  # Align guest hostname with imported container name
+  info(fmt"Setting container hostname to '{containerName}'...")
+  exitCode = setContainerHostname(containerName, containerName)
+  if exitCode != 0:
     cleanup.run()
     return ord(ecError)
 

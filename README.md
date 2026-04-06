@@ -233,6 +233,24 @@ In both forms, the cloned environment:
 - Keeps the same local host directory mounts as the source container
 
 Use a live clone for fast local duplication, or a snapshot clone when you need a deliberate point-in-time base.
+
+## Export and Import
+
+Use `ocdev export` to create a portable container tarball and `ocdev import` to restore it on another host:
+
+```bash
+# Export from source host
+ocdev export myproject --output /tmp/myproject.tar.gz
+
+# Import on destination host
+ocdev import myproject-restored --file /tmp/myproject.tar.gz
+```
+
+During import, `ocdev` rewrites host-specific settings so the restored environment is ready on the new machine:
+- Allocates fresh SSH and service ports
+- Recreates host disk mounts for the destination host
+- Sets the guest hostname to match the imported container name (for example, `ocdev-myproject-restored`)
+
 ## Custom Setup Scripts
 
 Run a custom script after container provisioning using `--post-create`:
