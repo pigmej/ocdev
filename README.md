@@ -10,7 +10,7 @@ This is especially useful when you need to run **complex projects requiring mult
 - **Non-root user** - Runs as `dev` user with matching UID, passwordless sudo available
 - **SSH access** - Unique port per container (starting at 2200, incrementing by 10)
 - **Service ports** - 10 additional forwarded ports per container for services (2300-2309, 2310-2319, etc.)
-- **Shared configs** - Automatically mounts `~/.config`, `~/.opencode`, `~/.ssh`, `~/.gitconfig`
+- **Shared configs** - Automatically mounts `~/.config`, `~/.opencode`, `~/.claude`, `~/.codex`, `~/.omp`, `~/.ssh`, `~/.gitconfig`
 - **Docker-in-Docker** - Full Docker support via Incus nesting
 - **Low overhead** - ~100-200MB RAM per container vs 512MB+ for VMs
 - **Custom setup scripts** - Run post-create scripts to install additional tools
@@ -201,6 +201,9 @@ sudo ufw status numbered
 |-----------|----------------|------|
 | `~/.config` | `/home/dev/.config` | read-write |
 | `~/.opencode` | `/home/dev/.opencode` | read-write |
+| `~/.claude` | `/home/dev/.claude` | read-write |
+| `~/.codex` | `/home/dev/.codex` | read-write |
+| `~/.omp` | `/home/dev/.omp` | read-write |
 | `~/.ssh` | `/home/dev/.ssh` | read-only |
 | `~/.gitconfig` | `/home/dev/.gitconfig` | read-only |
 
