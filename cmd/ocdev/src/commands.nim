@@ -1,5 +1,5 @@
 ## Command implementations for ocdev
-import std/[os, osproc, strutils, strformat, posix]
+import std/[os, osproc, strutils, strformat, posix, json]
 import config, output, container, ports, profile, provision, postinstall
 
 const
@@ -127,26 +127,48 @@ proc findPortBinding(hostPort: int): string =
       return containerName
   return ""
 
+proc getProxyDevices(containerName: string): seq[string] =
+  ## Get all local proxy devices on a container.
+  ## Cloned containers inherit source proxy devices, including ad-hoc host-* proxies.
+  let (deviceList, exitCode) = execCmdEx("incus config device list " & quoteShell(containerName))
+  if exitCode != 0:
+    return @[]
+
+  for line in deviceList.strip().splitLines():
+    let deviceName = line.strip()
+    if deviceName.len == 0:
+      continue
+    let (deviceType, typeExit) = execCmdEx("incus config device get " &
+      quoteShell(containerName) & " " & quoteShell(deviceName) & " type 2>/dev/null")
+    if typeExit == 0 and deviceType.strip() == "proxy":
+      result.add(deviceName)
+
 proc reconfigureProxyDevices(containerName: string, port: int): int =
-  ## Remove inherited proxy devices and add new ones with correct ports
-  ## Also removes dynamic bindings (dyn-*) to avoid port conflicts with source container
-  var standardDevices = @["ssh-proxy"]
+  ## Remove inherited proxy devices and add new ones with correct ports.
+  ## All local proxy devices must be removed because copied host-* proxies can
+  ## conflict with the source container when the clone starts.
+  var devicesToRemove = getProxyDevices(containerName)
+
+  # Keep the old name-based fallback for compatibility if Incus cannot report
+  # device types for some reason.
+  var fallbackDevices = @["ssh-proxy"]
   for i in 0 ..< ServicePortsCount:
-    standardDevices.add("svc-proxy-" & $i)
-  
-  # Also remove dynamic bindings - they would conflict with source container
+    fallbackDevices.add("svc-proxy-" & $i)
   let dynamicBindings = getDynamicBindings(containerName)
   for binding in dynamicBindings:
-    standardDevices.add("dyn-" & $binding.hostPort)
-  
-  for device in standardDevices:
+    fallbackDevices.add("dyn-" & $binding.hostPort)
+  for device in fallbackDevices:
+    if device notin devicesToRemove:
+      devicesToRemove.add(device)
+
+  for device in devicesToRemove:
     if deviceExists(containerName, device):
-      let exitCode = execCmd(fmt"incus config device remove {containerName} {device}")
+      let exitCode = execCmd("incus config device remove " & quoteShell(containerName) & " " & quoteShell(device))
       if exitCode != 0:
         error(fmt"Failed to remove device {device}")
         return exitCode
   
-  var exitCode = execCmd(fmt"incus config device add {containerName} ssh-proxy proxy " &
+  var exitCode = execCmd(fmt"incus config device add {quoteShell(containerName)} ssh-proxy proxy " &
                          fmt"listen=tcp:0.0.0.0:{port} connect=tcp:127.0.0.1:22 bind=host")
   if exitCode != 0:
     error("Failed to add SSH proxy device")
@@ -155,13 +177,75 @@ proc reconfigureProxyDevices(containerName: string, port: int): int =
   let serviceBase = getServicePortBase(port)
   for i in 0 ..< ServicePortsCount:
     let servicePort = serviceBase + i
-    exitCode = execCmd(fmt"incus config device add {containerName} svc-proxy-{i} proxy " &
+    exitCode = execCmd(fmt"incus config device add {quoteShell(containerName)} svc-proxy-{i} proxy " &
                        fmt"listen=tcp:0.0.0.0:{servicePort} connect=tcp:127.0.0.1:{servicePort} bind=host")
     if exitCode != 0:
       error(fmt"Failed to add service proxy device {i}")
       return exitCode
   
   result = 0
+
+# --- Fast clone storage helper ---
+
+proc getInstanceRootPool(containerName: string): tuple[pool: string, err: string] =
+  ## Return the Incus storage pool used by the instance root disk.
+  let queryPath = "/1.0/instances/" & containerName & "?recursion=1"
+  let (output, exitCode) = execCmdEx("incus query " & quoteShell(queryPath) & " 2>/dev/null")
+  if exitCode != 0:
+    return ("", fmt"Unable to inspect source container storage for '{containerName}'")
+
+  try:
+    let data = parseJson(output)
+    if data.kind != JObject or not data.hasKey("expanded_devices"):
+      return ("", fmt"Unable to inspect root disk for '{containerName}'")
+    let devices = data["expanded_devices"]
+    if devices.kind != JObject or not devices.hasKey("root"):
+      return ("", fmt"Unable to inspect root disk for '{containerName}'")
+    let root = devices["root"]
+    if root.kind != JObject or not root.hasKey("pool"):
+      return ("", fmt"Unable to inspect root storage pool for '{containerName}'")
+    let pool = root["pool"].getStr()
+    if pool.len == 0:
+      return ("", fmt"Unable to inspect root storage pool for '{containerName}'")
+    return (pool, "")
+  except CatchableError as e:
+    return ("", "Unable to parse Incus instance metadata: " & e.msg)
+
+proc getStorageDriver(pool: string): tuple[driver: string, err: string] =
+  ## Return the Incus storage driver for a pool.
+  let queryPath = "/1.0/storage-pools/" & pool
+  let (output, exitCode) = execCmdEx("incus query " & quoteShell(queryPath) & " 2>/dev/null")
+  if exitCode != 0:
+    return ("", fmt"Unable to inspect Incus storage pool '{pool}'")
+
+  try:
+    let data = parseJson(output)
+    if data.kind != JObject or not data.hasKey("driver"):
+      return ("", fmt"Unable to inspect Incus storage driver for pool '{pool}'")
+    let driver = data["driver"].getStr()
+    if driver.len == 0:
+      return ("", fmt"Unable to inspect Incus storage driver for pool '{pool}'")
+    return (driver, "")
+  except CatchableError as e:
+    return ("", "Unable to parse Incus storage metadata: " & e.msg)
+
+proc checkFastCloneStorage(sourceContainerName, sourceDisplay: string): tuple[ok: bool, err: string] =
+  ## Fail fast on storage backends where Incus snapshot/container copies are deep copies.
+  let (pool, poolErr) = getInstanceRootPool(sourceContainerName)
+  if poolErr.len > 0:
+    return (false, poolErr)
+
+  let (driver, driverErr) = getStorageDriver(pool)
+  if driverErr.len > 0:
+    return (false, driverErr)
+
+  if driver == "dir":
+    return (false,
+      fmt"Fast clone unavailable for '{sourceDisplay}': Incus pool '{pool}' uses driver 'dir', " &
+      "which performs a full filesystem copy. Move the base container to a CoW pool " &
+      "(btrfs, zfs, lvm, or ceph) and retry so ocdev create returns quickly.")
+
+  return (true, "")
 
 # --- Container cleanup helper ---
 
@@ -337,7 +421,7 @@ proc checkPrerequisites(): int =
   
   result = ord(ecSuccess)
 
-proc cmdCreate*(name: string, postCreate = "", `from` = ""): int =
+proc cmdCreate*(name: string, postCreate = "", fromSnapshot = "", `from` = ""): int =
   ## Create a new development container
   ## 
   ## Creates an Incus container with:
@@ -369,11 +453,20 @@ proc cmdCreate*(name: string, postCreate = "", `from` = ""): int =
       return ord(ecError)
   
   let containerName = ContainerPrefix & name
+  let cloneArg = if fromSnapshot.len > 0: fromSnapshot else: `from`
+
+  if fromSnapshot.len > 0 and `from`.len > 0:
+    error("Use either --from-snapshot/--fromSnapshot or --from, not both")
+    return ord(ecError)
   
-  if `from`.len > 0:
-    let (cloneSource, cloneValid, cloneErr) = parseCloneSource(`from`)
+  if cloneArg.len > 0:
+    let (cloneSource, cloneValid, cloneErr) = parseCloneSource(cloneArg)
     if not cloneValid:
       error(cloneErr)
+      return ord(ecError)
+
+    if fromSnapshot.len > 0 and cloneSource.kind != cskSnapshot:
+      error("Invalid snapshot format. Use container/snapshot (e.g., mycontainer/initial)")
       return ord(ecError)
 
     if not containerExists(cloneSource.container):
@@ -392,6 +485,14 @@ proc cmdCreate*(name: string, postCreate = "", `from` = ""): int =
       error("Container '" & name & "' already exists")
       return ord(ecError)
 
+    let sourceFullName = ContainerPrefix & cloneSource.container
+    let sourceRef = if cloneSource.kind == cskSnapshot: sourceFullName & "/" & cloneSource.snapshot else: sourceFullName
+    let sourceDisplay = if cloneSource.kind == cskSnapshot: cloneSource.container & "/" & cloneSource.snapshot else: cloneSource.container
+    let (fastCloneOk, fastCloneErr) = checkFastCloneStorage(sourceFullName, sourceDisplay)
+    if not fastCloneOk:
+      error(fastCloneErr)
+      return ord(ecError)
+
     # Allocate port
     let (port, portErr) = allocatePortSafe()
     if portErr.len > 0:
@@ -400,9 +501,6 @@ proc cmdCreate*(name: string, postCreate = "", `from` = ""): int =
 
     var cleanup = initCleanup(containerName)
 
-    let sourceFullName = ContainerPrefix & cloneSource.container
-    let sourceRef = if cloneSource.kind == cskSnapshot: sourceFullName & "/" & cloneSource.snapshot else: sourceFullName
-    let sourceDisplay = if cloneSource.kind == cskSnapshot: cloneSource.container & "/" & cloneSource.snapshot else: cloneSource.container
     info(fmt"Cloning container from {sourceDisplay}...")
 
     var exitCode = execCmd("incus copy " & quoteShell(sourceRef) & " " & quoteShell(containerName))

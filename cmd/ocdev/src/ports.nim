@@ -56,14 +56,46 @@ proc readAllocatedPorts*(): seq[int] =
       except ValueError:
         discard  # Skip malformed lines
 
+proc getServicePortBase*(sshPort: int): int =
+  ## Calculate service port base from SSH port
+  ## SSH 2200 -> service base 2300, SSH 2210 -> service base 2310
+  result = ServicePortStart + (sshPort - SshPortStart)
+
+proc rangesOverlap(startA, endA, startB, endB: int): bool =
+  startA <= endB and startB <= endA
+
+proc isPortBlockAvailable*(sshPort: int, allocatedSshPorts: seq[int]): bool =
+  ## Check whether a candidate SSH port and its service range are free.
+  ## Each ocdev container reserves its SSH port plus ServicePortsCount service
+  ## ports derived from that SSH port. Without this check, SSH port 2300 can
+  ## collide with the first container's service range 2300-2309.
+  let serviceStart = getServicePortBase(sshPort)
+  let serviceEnd = serviceStart + ServicePortsCount - 1
+  if sshPort < 1 or sshPort > 65535 or serviceEnd > 65535:
+    return false
+
+  for allocatedSsh in allocatedSshPorts:
+    let allocatedServiceStart = getServicePortBase(allocatedSsh)
+    let allocatedServiceEnd = allocatedServiceStart + ServicePortsCount - 1
+    if sshPort == allocatedSsh:
+      return false
+    if sshPort >= allocatedServiceStart and sshPort <= allocatedServiceEnd:
+      return false
+    if allocatedSsh >= serviceStart and allocatedSsh <= serviceEnd:
+      return false
+    if rangesOverlap(serviceStart, serviceEnd, allocatedServiceStart, allocatedServiceEnd):
+      return false
+  result = true
+
 proc allocatePort*(): int =
-  ## Find next available SSH port (called within lock context)
-  ## Ports increment by PORTS_PER_VM (10) starting at SSH_PORT_START (2200)
+  ## Find next available SSH port (called within lock context).
+  ## Ports increment by PORTS_PER_VM (10) starting at SSH_PORT_START (2200),
+  ## while avoiding both existing SSH ports and existing service port ranges.
   let allocated = readAllocatedPorts()
   var port = SshPortStart
-  while port in allocated:
+  while not isPortBlockAvailable(port, allocated):
     port += PortsPerVm
-    if port > 65535:
+    if port > 65535 or getServicePortBase(port) + ServicePortsCount - 1 > 65535:
       raise newException(ValueError, "No available ports (all from " & 
                          $SshPortStart & " are allocated)")
   result = port
@@ -101,8 +133,3 @@ proc getPort*(name: string): int =
       except ValueError:
         return 0
   result = 0
-
-proc getServicePortBase*(sshPort: int): int =
-  ## Calculate service port base from SSH port
-  ## SSH 2200 -> service base 2300, SSH 2210 -> service base 2310
-  result = ServicePortStart + (sshPort - SshPortStart)

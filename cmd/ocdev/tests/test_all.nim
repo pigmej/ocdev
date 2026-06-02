@@ -54,6 +54,20 @@ suite "Port calculation":
       let expectedServiceBase = ServicePortStart + (i * PortsPerVm)
       check getServicePortBase(sshPort) == expectedServiceBase
 
+  test "port blocks reserve ssh and service ranges":
+    check isPortBlockAvailable(2200, @[2200]) == false
+    check isPortBlockAvailable(2300, @[2200]) == false
+    check isPortBlockAvailable(2309, @[2200]) == false
+    check isPortBlockAvailable(2200, @[2300]) == false
+
+  test "port blocks skip existing service bands":
+    var allocated: seq[int] = @[]
+    for i in 0..9:
+      allocated.add(SshPortStart + (i * PortsPerVm))
+    check isPortBlockAvailable(2300, allocated) == false
+    check isPortBlockAvailable(2390, allocated) == false
+    check isPortBlockAvailable(2400, allocated) == true
+
 suite "Constants":
   test "exit codes have correct values":
     check ord(ecSuccess) == 0
