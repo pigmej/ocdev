@@ -1,5 +1,5 @@
 ## Unit tests for ocdev
-import std/strutils
+import std/[os, strutils]
 import unittest
 import ../src/container
 import ../src/ports
@@ -67,6 +67,54 @@ suite "Port calculation":
     check isPortBlockAvailable(2300, allocated) == false
     check isPortBlockAvailable(2390, allocated) == false
     check isPortBlockAvailable(2400, allocated) == true
+
+suite "Herdr isolation paths":
+  test "builds per-instance path from the full Incus name":
+    check getHerdrDir("/home/test-user", "ocdev-my-project") ==
+      "/home/test-user/.local/share/ocdev/herdr/ocdev-my-project"
+
+  test "preserves spaces in the host home path":
+    check getHerdrDir("/home/test user", "ocdev-project") ==
+      "/home/test user/.local/share/ocdev/herdr/ocdev-project"
+
+  test "central host device list includes isolated Herdr mount":
+    check HerdrDeviceName in HostDiskDeviceNames
+    check HerdrDeviceName == "host-herdr"
+    check HerdrContainerPath == "/home/dev/.config/herdr"
+
+  test "uses private directory permissions":
+    check HerdrDirectoryPermissions == {fpUserRead, fpUserWrite, fpUserExec}
+
+  test "accepts only the exact expected Herdr device definition":
+    let expectedSource = "/home/test/.local/share/ocdev/herdr/ocdev-project"
+    check herdrDeviceMatches("disk", expectedSource, HerdrContainerPath, expectedSource)
+    check not herdrDeviceMatches("proxy", expectedSource, HerdrContainerPath, expectedSource)
+    check not herdrDeviceMatches("disk", "/home/other/herdr", HerdrContainerPath, expectedSource)
+    check not herdrDeviceMatches("disk", expectedSource, "/home/dev/.config/other", expectedSource)
+
+suite "Export state handling":
+  test "parses running and stopped Incus states":
+    check parseInstanceRunningState("Name: ocdev-test\nStatus: RUNNING\n") == (true, true)
+    check parseInstanceRunningState("Name: ocdev-test\nStatus: STOPPED\n") == (true, false)
+
+  test "does not assume stopped when status is missing":
+    check parseInstanceRunningState("Name: ocdev-test\n") == (false, false)
+
+  test "restarts only after complete device restoration":
+    check mayRestartAfterExport(true, 0)
+    check not mayRestartAfterExport(true, 1)
+    check not mayRestartAfterExport(false, 0)
+
+suite "Failed-create cleanup":
+  test "removes Herdr state after successful deletion":
+    check mayRemoveHerdrAfterCleanup(0, 0, "")
+
+  test "removes Herdr state when Incus confirms absence":
+    check mayRemoveHerdrAfterCleanup(1, 1, "Error: Instance not found")
+
+  test "preserves Herdr state when instance remains or inspection is inconclusive":
+    check not mayRemoveHerdrAfterCleanup(1, 0, "Name: ocdev-test")
+    check not mayRemoveHerdrAfterCleanup(1, 1, "Error: connection refused")
 
 suite "Constants":
   test "exit codes have correct values":

@@ -11,6 +11,21 @@ const
   PortsPerVm* = 10
   ServicePortsCount* = 10
   MaxNameLength* = 50
+  HerdrDeviceName* = "host-herdr"
+  HerdrContainerPath* = "/home/dev/.config/herdr"
+  HerdrDirectoryPermissions* = {fpUserRead, fpUserWrite, fpUserExec}
+  HostDiskDeviceNames* = [
+    HerdrDeviceName,
+    "host-config",
+    "host-opencode",
+    "host-claude",
+    "host-codex",
+    "host-omp",
+    "host-ssh",
+    "host-gitconfig",
+    "host-oc-share",
+    "host-oc-state"
+  ]
 
 # Runtime computed paths (can't be const because getHomeDir is runtime)
 proc getOcdevDir*(): string =
@@ -21,6 +36,13 @@ proc getPortsFile*(): string =
 
 proc getLockFile*(): string =
   getOcdevDir() / ".lock"
+
+proc getHerdrDir*(homeDir, fullInstanceName: string): string =
+  ## Return the host directory used for an instance's isolated Herdr state.
+  homeDir / ".local" / "share" / "ocdev" / "herdr" / fullInstanceName
+
+proc getInstanceHerdrDir*(fullInstanceName: string): string =
+  getHerdrDir(getHomeDir(), fullInstanceName)
 
 # Convenience aliases for backward compatibility
 template OcdevDir*: string = getOcdevDir()

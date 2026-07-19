@@ -6,15 +6,80 @@ const
   MinPort = 1
   MaxPort = 65535
 
-proc deviceExists(containerName, deviceName: string): bool =
-  ## Check if a device exists on a container
-  let (output, exitCode) = execCmdEx(fmt"incus config device list {containerName}")
+proc inspectDeviceNames(containerName: string): tuple[names: seq[string], err: string] =
+  ## Return local device names, distinguishing an empty list from inspection failure.
+  let (output, exitCode) = execCmdEx("incus config device list " &
+    quoteShell(containerName) & " 2>&1")
   if exitCode != 0:
-    return false
+    return (@[], fmt"Failed to inspect devices on '{containerName}': {output.strip()}")
   for line in output.strip().splitLines():
-    if line.strip() == deviceName:
-      return true
-  return false
+    let deviceName = line.strip()
+    if deviceName.len > 0:
+      result.names.add(deviceName)
+
+proc inspectDevicePresence(containerName, deviceName: string): tuple[exists: bool, err: string] =
+  let (deviceNames, inspectErr) = inspectDeviceNames(containerName)
+  if inspectErr.len > 0:
+    return (false, inspectErr)
+  return (deviceName in deviceNames, "")
+
+proc deviceExists(containerName, deviceName: string): bool =
+  ## Best-effort device check for non-critical lookup paths.
+  let (exists, _) = inspectDevicePresence(containerName, deviceName)
+  return exists
+
+proc getDeviceProperty(containerName, deviceName, propertyName: string): tuple[value, err: string] =
+  let (output, exitCode) = execCmdEx("incus config device get " &
+    quoteShell(containerName) & " " & quoteShell(deviceName) & " " &
+    quoteShell(propertyName) & " 2>&1")
+  if exitCode != 0:
+    return ("", fmt"Failed to inspect {propertyName} for device '{deviceName}' on '{containerName}': {output.strip()}")
+  return (output.strip(), "")
+
+proc herdrDeviceMatches*(deviceType, sourcePath, targetPath, expectedSource: string): bool =
+  ## Pure comparison used before accepting an existing host-herdr device.
+  deviceType == "disk" and sourcePath == expectedSource and targetPath == HerdrContainerPath
+
+proc parseInstanceRunningState*(output: string): tuple[known, running: bool] =
+  ## Parse Incus' human-readable status without treating missing status as stopped.
+  for line in output.splitLines():
+    let stripped = line.strip()
+    if stripped.startsWith("Status:"):
+      let status = stripped["Status:".len .. ^1].strip()
+      return (true, status == "RUNNING")
+  return (false, false)
+
+proc inspectInstanceRunning(containerName: string): tuple[running: bool, err: string] =
+  let (output, exitCode) = execCmdEx("incus info " & quoteShell(containerName) & " 2>&1")
+  if exitCode != 0:
+    return (false, fmt"Failed to inspect state for '{containerName}': {output.strip()}")
+  let state = parseInstanceRunningState(output)
+  if not state.known:
+    return (false, fmt"Failed to determine running state for '{containerName}'")
+  return (state.running, "")
+
+proc incusConfirmsAbsent*(exitCode: int, output: string): bool =
+  ## A failed inspection confirms absence only when Incus explicitly identifies
+  ## the instance itself as missing, not for unrelated connection/project errors.
+  let message = output.toLowerAscii()
+  exitCode != 0 and ("instance not found" in message or
+    "instance does not exist" in message)
+
+proc mayRemoveHerdrAfterCleanup*(deleteExitCode, inspectExitCode: int,
+                                 inspectOutput: string): bool =
+  deleteExitCode == 0 or incusConfirmsAbsent(inspectExitCode, inspectOutput)
+
+proc inspectInstanceAbsent(containerName: string): tuple[absent: bool, err: string] =
+  ## Confirm that a destination instance is absent before resetting host-side state.
+  let (output, exitCode) = execCmdEx("incus info " & quoteShell(containerName) & " 2>&1")
+  if exitCode == 0:
+    return (false, "")
+  if incusConfirmsAbsent(exitCode, output):
+    return (true, "")
+  return (false, fmt"Failed to confirm that '{containerName}' is absent: {output.strip()}")
+
+proc mayRestartAfterExport*(wasRunning: bool, restorationFailureCount: int): bool =
+  wasRunning and restorationFailureCount == 0
 
 proc parsePortArg*(portArg: string): tuple[containerPort, hostPort: int, valid: bool, errMsg: string] =
   ## Parse port argument: "PORT" or "CONTAINER_PORT:HOST_PORT"
@@ -127,30 +192,31 @@ proc findPortBinding(hostPort: int): string =
       return containerName
   return ""
 
-proc getProxyDevices(containerName: string): seq[string] =
-  ## Get all local proxy devices on a container.
+proc getProxyDevices(containerName: string): tuple[devices: seq[string], err: string] =
+  ## Get all local proxy devices on a container, propagating inspection errors.
   ## Cloned containers inherit source proxy devices, including ad-hoc host-* proxies.
-  let (deviceList, exitCode) = execCmdEx("incus config device list " & quoteShell(containerName))
-  if exitCode != 0:
-    return @[]
+  let (deviceNames, inspectErr) = inspectDeviceNames(containerName)
+  if inspectErr.len > 0:
+    return (@[], inspectErr)
 
-  for line in deviceList.strip().splitLines():
-    let deviceName = line.strip()
-    if deviceName.len == 0:
-      continue
-    let (deviceType, typeExit) = execCmdEx("incus config device get " &
-      quoteShell(containerName) & " " & quoteShell(deviceName) & " type 2>/dev/null")
-    if typeExit == 0 and deviceType.strip() == "proxy":
-      result.add(deviceName)
+  for deviceName in deviceNames:
+    let (deviceType, typeErr) = getDeviceProperty(containerName, deviceName, "type")
+    if typeErr.len > 0:
+      return (@[], typeErr)
+    if deviceType == "proxy":
+      result.devices.add(deviceName)
 
 proc reconfigureProxyDevices(containerName: string, port: int): int =
   ## Remove inherited proxy devices and add new ones with correct ports.
   ## All local proxy devices must be removed because copied host-* proxies can
   ## conflict with the source container when the clone starts.
-  var devicesToRemove = getProxyDevices(containerName)
+  let (proxyDevices, proxyInspectErr) = getProxyDevices(containerName)
+  if proxyInspectErr.len > 0:
+    error(proxyInspectErr)
+    return ord(ecError)
+  var devicesToRemove = proxyDevices
 
-  # Keep the old name-based fallback for compatibility if Incus cannot report
-  # device types for some reason.
+  # Keep the old name-based fallback for compatibility with standard devices.
   var fallbackDevices = @["ssh-proxy"]
   for i in 0 ..< ServicePortsCount:
     fallbackDevices.add("svc-proxy-" & $i)
@@ -159,14 +225,19 @@ proc reconfigureProxyDevices(containerName: string, port: int): int =
     fallbackDevices.add("dyn-" & $binding.hostPort)
   for device in fallbackDevices:
     if device notin devicesToRemove:
-      devicesToRemove.add(device)
+      let (exists, presenceErr) = inspectDevicePresence(containerName, device)
+      if presenceErr.len > 0:
+        error(presenceErr)
+        return ord(ecError)
+      if exists:
+        devicesToRemove.add(device)
 
   for device in devicesToRemove:
-    if deviceExists(containerName, device):
-      let exitCode = execCmd("incus config device remove " & quoteShell(containerName) & " " & quoteShell(device))
-      if exitCode != 0:
-        error(fmt"Failed to remove device {device}")
-        return exitCode
+    let exitCode = execCmd("incus config device remove " &
+      quoteShell(containerName) & " " & quoteShell(device))
+    if exitCode != 0:
+      error(fmt"Failed to remove device {device}")
+      return exitCode
   
   var exitCode = execCmd(fmt"incus config device add {quoteShell(containerName)} ssh-proxy proxy " &
                          fmt"listen=tcp:0.0.0.0:{port} connect=tcp:127.0.0.1:22 bind=host")
@@ -247,6 +318,45 @@ proc checkFastCloneStorage(sourceContainerName, sourceDisplay: string): tuple[ok
 
   return (true, "")
 
+# --- Per-instance Herdr directory helpers ---
+
+proc prepareHerdrDirectory(containerName: string, fresh: bool): tuple[path, err: string] =
+  ## Create the private host directory for an instance. Fresh preparation
+  ## removes any previous destination state; ensure-only preparation preserves it.
+  let path = getInstanceHerdrDir(containerName)
+  try:
+    if fresh:
+      if symlinkExists(path) or fileExists(path):
+        removeFile(path)
+      elif dirExists(path):
+        removeDir(path)
+    elif symlinkExists(path) or (fileExists(path) and not dirExists(path)):
+      return (path, fmt"Herdr path exists but is not a directory: {path}")
+
+    createDir(path)
+    setFilePermissions(path, HerdrDirectoryPermissions)
+    return (path, "")
+  except OSError as e:
+    return (path, fmt"Failed to prepare Herdr directory '{path}': {e.msg}")
+
+proc freshHerdrDirectory(containerName: string): tuple[path, err: string] =
+  return prepareHerdrDirectory(containerName, fresh = true)
+
+proc ensureHerdrDirectory(containerName: string): tuple[path, err: string] =
+  return prepareHerdrDirectory(containerName, fresh = false)
+
+proc removeHerdrDirectory(containerName: string): string =
+  ## Remove an instance's host-side Herdr state. Returns an error message on failure.
+  let path = getInstanceHerdrDir(containerName)
+  try:
+    if symlinkExists(path) or fileExists(path):
+      removeFile(path)
+    elif dirExists(path):
+      removeDir(path)
+    return ""
+  except OSError as e:
+    return fmt"Failed to remove Herdr directory '{path}': {e.msg}"
+
 # --- Container cleanup helper ---
 
 type
@@ -260,10 +370,27 @@ proc initCleanup(containerName: string): ContainerCleanup =
   ContainerCleanup(containerName: containerName, needed: true)
 
 proc run(c: var ContainerCleanup) =
-  ## Execute cleanup if needed (delete the container)
+  ## Delete a failed instance, removing host state only after deletion succeeds
+  ## or Incus explicitly confirms that the instance is absent.
   if c.needed:
     warn("Cleaning up failed container...")
-    discard execCmd("incus delete --force " & c.containerName & " 2>/dev/null")
+    let (_, deleteExit) = execCmdEx("incus delete --force " &
+      quoteShell(c.containerName) & " 2>&1")
+
+    var inspectExit = 0
+    var inspectOutput = ""
+    if deleteExit != 0:
+      (inspectOutput, inspectExit) = execCmdEx("incus info " &
+        quoteShell(c.containerName) & " 2>&1")
+
+    if mayRemoveHerdrAfterCleanup(deleteExit, inspectExit, inspectOutput):
+      let herdrErr = removeHerdrDirectory(c.containerName)
+      if herdrErr.len > 0:
+        warn(herdrErr)
+    elif inspectExit == 0:
+      warn(fmt"Failed to delete '{c.containerName}'; instance still exists, preserving its Herdr directory")
+    else:
+      warn(fmt"Failed to confirm deletion of '{c.containerName}'; preserving its Herdr directory: {inspectOutput.strip()}")
 
 proc cancel(c: var ContainerCleanup) =
   ## Mark cleanup as no longer needed (success path)
@@ -332,75 +459,198 @@ proc addProxyDevices(containerName: string, sshPort: int): int =
 
 # --- Disk mount helper ---
 
+proc addDiskMount(containerName, deviceName, sourcePath, targetPath: string,
+                  readonly = false): int =
+  ## Add a quoted host disk device to an instance.
+  var command = "incus config device add " & quoteShell(containerName) & " " &
+    quoteShell(deviceName) & " disk " & quoteShell("source=" & sourcePath) & " " &
+    quoteShell("path=" & targetPath)
+  if readonly:
+    command.add(" readonly=true")
+  command.add(" shift=true")
+  execCmd(command)
+
+proc ensureHerdrMount(containerName: string): int =
+  ## Ensure the isolated Herdr mount exists with the exact expected definition.
+  ## Existing devices with the right name but wrong type/source/path are replaced.
+  let (herdrPath, herdrErr) = ensureHerdrDirectory(containerName)
+  if herdrErr.len > 0:
+    error(herdrErr)
+    return ord(ecError)
+
+  let (exists, presenceErr) = inspectDevicePresence(containerName, HerdrDeviceName)
+  if presenceErr.len > 0:
+    error(presenceErr)
+    return ord(ecError)
+
+  if exists:
+    let (deviceType, typeErr) = getDeviceProperty(containerName, HerdrDeviceName, "type")
+    if typeErr.len > 0:
+      error(typeErr)
+      return ord(ecError)
+    let (sourcePath, sourceErr) = getDeviceProperty(containerName, HerdrDeviceName, "source")
+    if sourceErr.len > 0:
+      error(sourceErr)
+      return ord(ecError)
+    let (targetPath, pathErr) = getDeviceProperty(containerName, HerdrDeviceName, "path")
+    if pathErr.len > 0:
+      error(pathErr)
+      return ord(ecError)
+
+    if herdrDeviceMatches(deviceType, sourcePath, targetPath, herdrPath):
+      return 0
+
+    let removeExit = execCmd("incus config device remove " &
+      quoteShell(containerName) & " " & quoteShell(HerdrDeviceName))
+    if removeExit != 0:
+      error("Failed to remove mismatched Herdr mount")
+      return removeExit
+
+  let exitCode = addDiskMount(containerName, HerdrDeviceName, herdrPath, HerdrContainerPath)
+  if exitCode != 0:
+    error("Failed to mount isolated Herdr configuration")
+  return exitCode
+
+proc replaceHerdrMount(containerName: string): int =
+  ## A clone may inherit the source device; ensureHerdrMount validates/replaces it.
+  return ensureHerdrMount(containerName)
+
 proc addDiskMounts(containerName: string): int =
   ## Add host directory disk mounts to container
   ## Returns 0 on success, non-zero on failure
   let homeDir = getHomeDir()
-  
+
   if dirExists(homeDir / ".config"):
-    let exitCode = execCmd(fmt"incus config device add {containerName} host-config disk " &
-                           fmt"source={homeDir}/.config path=/home/dev/.config shift=true")
+    let exitCode = addDiskMount(containerName, "host-config", homeDir / ".config", "/home/dev/.config")
     if exitCode != 0:
       error("Failed to mount ~/.config")
       return exitCode
-  
+
+  let herdrExit = ensureHerdrMount(containerName)
+  if herdrExit != 0:
+    return herdrExit
+
   if dirExists(homeDir / ".opencode"):
-    let exitCode = execCmd(fmt"incus config device add {containerName} host-opencode disk " &
-                           fmt"source={homeDir}/.opencode path=/home/dev/.opencode shift=true")
+    let exitCode = addDiskMount(containerName, "host-opencode", homeDir / ".opencode", "/home/dev/.opencode")
     if exitCode != 0:
       error("Failed to mount ~/.opencode")
       return exitCode
 
   if dirExists(homeDir / ".claude"):
-    let exitCode = execCmd(fmt"incus config device add {containerName} host-claude disk " &
-                           fmt"source={homeDir}/.claude path=/home/dev/.claude shift=true")
+    let exitCode = addDiskMount(containerName, "host-claude", homeDir / ".claude", "/home/dev/.claude")
     if exitCode != 0:
       error("Failed to mount ~/.claude")
       return exitCode
 
   if dirExists(homeDir / ".codex"):
-    let exitCode = execCmd(fmt"incus config device add {containerName} host-codex disk " &
-                           fmt"source={homeDir}/.codex path=/home/dev/.codex shift=true")
+    let exitCode = addDiskMount(containerName, "host-codex", homeDir / ".codex", "/home/dev/.codex")
     if exitCode != 0:
       error("Failed to mount ~/.codex")
       return exitCode
 
   if dirExists(homeDir / ".omp"):
-    let exitCode = execCmd(fmt"incus config device add {containerName} host-omp disk " &
-                           fmt"source={homeDir}/.omp path=/home/dev/.omp shift=true")
+    let exitCode = addDiskMount(containerName, "host-omp", homeDir / ".omp", "/home/dev/.omp")
     if exitCode != 0:
       error("Failed to mount ~/.omp")
       return exitCode
-  
+
   if dirExists(homeDir / ".ssh"):
-    let exitCode = execCmd(fmt"incus config device add {containerName} host-ssh disk " &
-                           fmt"source={homeDir}/.ssh path=/home/dev/.ssh readonly=true shift=true")
+    let exitCode = addDiskMount(containerName, "host-ssh", homeDir / ".ssh", "/home/dev/.ssh", readonly = true)
     if exitCode != 0:
       error("Failed to mount ~/.ssh")
       return exitCode
-  
+
   if fileExists(homeDir / ".gitconfig"):
-    let exitCode = execCmd(fmt"incus config device add {containerName} host-gitconfig disk " &
-                           fmt"source={homeDir}/.gitconfig path=/home/dev/.gitconfig readonly=true shift=true")
+    let exitCode = addDiskMount(containerName, "host-gitconfig", homeDir / ".gitconfig", "/home/dev/.gitconfig", readonly = true)
     if exitCode != 0:
       error("Failed to mount ~/.gitconfig")
       return exitCode
-  
+
   if dirExists(homeDir / ".local" / "share" / "opencode"):
-    let exitCode = execCmd(fmt"incus config device add {containerName} host-oc-share disk " &
-                           fmt"source={homeDir}/.local/share/opencode path=/home/dev/.local/share/opencode shift=true")
+    let exitCode = addDiskMount(containerName, "host-oc-share", homeDir / ".local" / "share" / "opencode", "/home/dev/.local/share/opencode")
     if exitCode != 0:
       error("Failed to mount ~/.local/share/opencode")
       return exitCode
-  
+
   if dirExists(homeDir / ".local" / "state" / "opencode"):
-    let exitCode = execCmd(fmt"incus config device add {containerName} host-oc-state disk " &
-                           fmt"source={homeDir}/.local/state/opencode path=/home/dev/.local/state/opencode shift=true")
+    let exitCode = addDiskMount(containerName, "host-oc-state", homeDir / ".local" / "state" / "opencode", "/home/dev/.local/state/opencode")
     if exitCode != 0:
       error("Failed to mount ~/.local/state/opencode")
       return exitCode
-  
+
   result = 0
+
+proc addExpectedHostDiskDevice(containerName, deviceName: string): int =
+  ## Recreate one standard host disk device after export.
+  let homeDir = getHomeDir()
+  case deviceName
+  of HerdrDeviceName:
+    return ensureHerdrMount(containerName)
+  of "host-config":
+    return addDiskMount(containerName, deviceName, homeDir / ".config", "/home/dev/.config")
+  of "host-opencode":
+    return addDiskMount(containerName, deviceName, homeDir / ".opencode", "/home/dev/.opencode")
+  of "host-claude":
+    return addDiskMount(containerName, deviceName, homeDir / ".claude", "/home/dev/.claude")
+  of "host-codex":
+    return addDiskMount(containerName, deviceName, homeDir / ".codex", "/home/dev/.codex")
+  of "host-omp":
+    return addDiskMount(containerName, deviceName, homeDir / ".omp", "/home/dev/.omp")
+  of "host-ssh":
+    return addDiskMount(containerName, deviceName, homeDir / ".ssh", "/home/dev/.ssh", readonly = true)
+  of "host-gitconfig":
+    return addDiskMount(containerName, deviceName, homeDir / ".gitconfig", "/home/dev/.gitconfig", readonly = true)
+  of "host-oc-share":
+    return addDiskMount(containerName, deviceName, homeDir / ".local" / "share" / "opencode", "/home/dev/.local/share/opencode")
+  of "host-oc-state":
+    return addDiskMount(containerName, deviceName, homeDir / ".local" / "state" / "opencode", "/home/dev/.local/state/opencode")
+  else:
+    return ord(ecError)
+
+proc addExpectedProxyDevice(containerName, deviceName: string, sshPort: int): int =
+  ## Recreate one standard proxy device after export.
+  if sshPort <= 0:
+    return ord(ecError)
+
+  var listenPort, connectPort: int
+  if deviceName == "ssh-proxy":
+    listenPort = sshPort
+    connectPort = 22
+  elif deviceName.startsWith("svc-proxy-"):
+    let indexText = deviceName["svc-proxy-".len .. ^1]
+    let index = try: parseInt(indexText) except ValueError: -1
+    if index < 0 or index >= ServicePortsCount:
+      return ord(ecError)
+    listenPort = getServicePortBase(sshPort) + index
+    connectPort = listenPort
+  else:
+    return ord(ecError)
+
+  return execCmd("incus config device add " & quoteShell(containerName) & " " &
+    quoteShell(deviceName) & " proxy " & quoteShell("listen=tcp:0.0.0.0:" & $listenPort) &
+    " " & quoteShell("connect=tcp:127.0.0.1:" & $connectPort) & " bind=host")
+
+proc restoreExportDevice(containerName, deviceName: string, sshPort: int): string =
+  ## Idempotently restore a device that was present before stripping. A failed
+  ## removal may have left it in place, so inspect before attempting an add.
+  if deviceName == HerdrDeviceName:
+    if ensureHerdrMount(containerName) != 0:
+      return fmt"Failed to restore device '{deviceName}'"
+    return ""
+
+  let (exists, inspectErr) = inspectDevicePresence(containerName, deviceName)
+  if inspectErr.len > 0:
+    return inspectErr
+  if exists:
+    return ""
+
+  let restoreExit = if deviceName in HostDiskDeviceNames:
+      addExpectedHostDiskDevice(containerName, deviceName)
+    else:
+      addExpectedProxyDevice(containerName, deviceName, sshPort)
+  if restoreExit != 0:
+    return fmt"Failed to restore device '{deviceName}'"
+  return ""
 
 proc checkPrerequisites(): int =
   ## Check incus command and group membership
@@ -480,8 +730,12 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = "", `from` = ""): 
     elif containerRunning(cloneSource.container):
       warn("Source container is running. Clone will proceed while the source stays running, but in-flight filesystem changes may not be fully consistent.")
 
-    # Check destination doesn't exist
-    if containerExists(name):
+    # Confirm absence before resetting any preserved destination Herdr state.
+    let (destinationAbsent, destinationErr) = inspectInstanceAbsent(containerName)
+    if destinationErr.len > 0:
+      error(destinationErr)
+      return ord(ecError)
+    if not destinationAbsent:
       error("Container '" & name & "' already exists")
       return ord(ecError)
 
@@ -499,6 +753,14 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = "", `from` = ""): 
       error(portErr)
       return ord(ecError)
 
+    let (_, herdrErr) = freshHerdrDirectory(containerName)
+    if herdrErr.len > 0:
+      error(herdrErr)
+      let cleanupErr = removeHerdrDirectory(containerName)
+      if cleanupErr.len > 0:
+        warn(cleanupErr)
+      return ord(ecError)
+
     var cleanup = initCleanup(containerName)
 
     info(fmt"Cloning container from {sourceDisplay}...")
@@ -507,6 +769,12 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = "", `from` = ""): 
     if exitCode != 0:
       let cloneFailure = if cloneSource.kind == cskSnapshot: "Failed to clone from snapshot" else: "Failed to clone from container"
       error(cloneFailure)
+      cleanup.run()
+      return ord(ecError)
+
+    # Clones inherit local devices, so replace the source Herdr mount before start.
+    exitCode = replaceHerdrMount(containerName)
+    if exitCode != 0:
       cleanup.run()
       return ord(ecError)
 
@@ -541,8 +809,12 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = "", `from` = ""): 
     success(fmt"Container '{name}' created from {sourceDisplay} (SSH: {port}, Services: {serviceBase}-{serviceEnd})")
     return ord(ecSuccess)
   
-  # Check container doesn't already exist
-  if containerExists(name):
+  # Confirm absence before resetting any preserved destination Herdr state.
+  let (destinationAbsent, destinationErr) = inspectInstanceAbsent(containerName)
+  if destinationErr.len > 0:
+    error(destinationErr)
+    return ord(ecError)
+  if not destinationAbsent:
     error("Container '" & name & "' already exists")
     return ord(ecError)
   
@@ -555,13 +827,21 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = "", `from` = ""): 
     error(portErr)
     return ord(ecError)
   
+  let (_, herdrErr) = freshHerdrDirectory(containerName)
+  if herdrErr.len > 0:
+    error(herdrErr)
+    let cleanupErr = removeHerdrDirectory(containerName)
+    if cleanupErr.len > 0:
+      warn(cleanupErr)
+    return ord(ecError)
+
   var cleanup = initCleanup(containerName)
   
   info(fmt"Creating container '{name}' with SSH port {port}...")
   
   # Launch container
-  var exitCode = execCmd("incus launch " & BaseImage & " " & containerName & 
-                         " --profile default --profile " & ProfileName)
+  var exitCode = execCmd("incus launch " & quoteShell(BaseImage) & " " & quoteShell(containerName) &
+                         " --profile default --profile " & quoteShell(ProfileName))
   if exitCode != 0:
     error("Failed to launch container")
     cleanup.run()
@@ -598,7 +878,7 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = "", `from` = ""): 
     error("Provisioning failed")
     cleanup.run()
     return ord(ecError)
-  
+
   # Run default post-install script as dev user
   info("Installing dev tools (uv, nvm, opencode)...")
   let postInstallTmp = getTempDir() / "ocdev-postinstall.sh"
@@ -615,8 +895,8 @@ proc cmdCreate*(name: string, postCreate = "", fromSnapshot = "", `from` = ""): 
     
     if postInstallExit != 0:
       warn("Default post-install completed with warnings (continuing...)")
-  
-  # Add disk devices (after provisioning so /home/dev is owned by dev user)
+
+  # Add disk devices after provisioning so host configs cannot affect installation.
   info("Configuring disk mounts...")
   exitCode = addDiskMounts(containerName)
   if exitCode != 0:
@@ -681,7 +961,11 @@ proc cmdStart*(name: string): int =
     return ord(ecSuccess)
   
   let containerName = ContainerPrefix & name
-  let exitCode = execCmd("incus start " & containerName)
+  let herdrExit = ensureHerdrMount(containerName)
+  if herdrExit != 0:
+    return ord(ecError)
+
+  let exitCode = execCmd("incus start " & quoteShell(containerName))
   if exitCode != 0:
     error("Failed to start container")
     return ord(ecError)
@@ -778,16 +1062,20 @@ proc cmdDelete*(name: string): int =
   # Stop if running
   if containerRunning(name):
     info("Stopping container...")
-    discard execCmd("incus stop " & containerName)
+    discard execCmd("incus stop " & quoteShell(containerName))
   
   # Delete container
-  let exitCode = execCmd("incus delete " & containerName)
+  let exitCode = execCmd("incus delete " & quoteShell(containerName))
   if exitCode != 0:
     error("Failed to delete container")
     return ord(ecError)
   
-  # Remove port allocation
+  # Remove port allocation and per-instance host state
   removePort(name)
+  let herdrErr = removeHerdrDirectory(containerName)
+  if herdrErr.len > 0:
+    error(herdrErr)
+    return ord(ecError)
   
   success(fmt"Container '{name}' deleted")
   result = ord(ecSuccess)
@@ -1002,15 +1290,8 @@ proc cmdRebind*(name: string, port: string): int =
   result = ord(ecSuccess)
 
 proc cmdExport*(name: string, output = ""): int =
-  ## Export a container as a portable tarball
-  ##
-  ## Creates a full backup of the container using 'incus export'.
-  ## The resulting file can be transferred to another server and
-  ## imported with 'ocdev import'.
-  ##
-  ## Works on both running and stopped containers. For maximum
-  ## consistency, stop the container first, but for dev environments
-  ## exporting while running is fine.
+  ## Export a container as a portable tarball. Running instances are stopped
+  ## before any nested host mount is removed and restarted after restoration.
   ##
   ## Examples:
   ##   ocdev export myvm
@@ -1020,7 +1301,6 @@ proc cmdExport*(name: string, output = ""): int =
   if prereq != 0:
     return prereq
 
-  # Validate name
   let (valid, msg) = validateName(name)
   if not valid:
     error("Invalid name: " & msg)
@@ -1030,45 +1310,122 @@ proc cmdExport*(name: string, output = ""): int =
     error(fmt"Container '{name}' not found")
     return ord(ecNotFound)
 
-  if containerRunning(name):
-    warn("Container is running. Export will proceed but filesystem may not be fully consistent.")
-
   let containerName = ContainerPrefix & name
+  let (wasRunning, stateErr) = inspectInstanceRunning(containerName)
+  if stateErr.len > 0:
+    error(stateErr)
+    return ord(ecError)
 
-  # Determine output path
+  if wasRunning:
+    info("Stopping container before removing host mounts...")
+    if execCmd("incus stop " & quoteShell(containerName)) != 0:
+      error("Failed to stop container; export aborted before stripping devices")
+      return ord(ecError)
+
   let outputPath = if output.len > 0: output
                    else: getCurrentDir() / fmt"{name}.tar.gz"
+  var proxyDevices = @["ssh-proxy"]
+  for i in 0 ..< ServicePortsCount:
+    proxyDevices.add("svc-proxy-" & $i)
 
-  # Temporarily remove host-specific devices (disk mounts, proxy ports)
-  # so the backup doesn't contain paths/ports tied to this host.
-  # We'll restore them after export.
-  let diskDevices = @["host-config", "host-opencode", "host-claude", "host-codex", "host-omp", "host-ssh",
-                      "host-gitconfig", "host-oc-share", "host-oc-state"]
-  let proxyDevices = @["ssh-proxy", "svc-proxy-0", "svc-proxy-1",
-                       "svc-proxy-2", "svc-proxy-3", "svc-proxy-4",
-                       "svc-proxy-5", "svc-proxy-6", "svc-proxy-7",
-                       "svc-proxy-8", "svc-proxy-9"]
+  var originalDevices: seq[string] = @[]
+  var operationFailure = ""
+  var exportExit = ord(ecError)
+  var restorationFailures: seq[string] = @[]
+  var restartFailure = ""
 
-  info("Stripping host-specific devices before export...")
-  for device in diskDevices & proxyDevices:
-    if deviceExists(containerName, device):
-      discard execCmd(fmt"incus config device remove {containerName} {device}")
+  try:
+    let (deviceNames, inspectErr) = inspectDeviceNames(containerName)
+    if inspectErr.len > 0:
+      operationFailure = inspectErr
+    else:
+      for device in HostDiskDeviceNames:
+        if device in deviceNames:
+          originalDevices.add(device)
+      for device in proxyDevices:
+        if device in deviceNames:
+          originalDevices.add(device)
 
-  # Export container (full backup including rootfs, without host-specific devices)
-  info(fmt"Exporting container '{name}'...")
-  let exitCode = execCmd(fmt"incus export {containerName} {quoteShell(outputPath)} --instance-only")
+      info("Stripping host-specific devices before export...")
+      for device in originalDevices:
+        let removeExit = execCmd("incus config device remove " &
+          quoteShell(containerName) & " " & quoteShell(device))
+        if removeExit != 0:
+          operationFailure = fmt"Failed to remove device '{device}'; export aborted"
+          error(operationFailure)
+          break
 
-  # Restore devices regardless of export result
-  info("Restoring host-specific devices...")
-  let port = getPort(name)
-  if port > 0:
-    if addProxyDevices(containerName, port) != 0:
-      warn("Failed to restore some proxy devices")
-  if addDiskMounts(containerName) != 0:
-    warn("Failed to restore some disk mounts")
+      if operationFailure.len == 0:
+        info(fmt"Exporting container '{name}'...")
+        exportExit = execCmd("incus export " & quoteShell(containerName) & " " &
+          quoteShell(outputPath) & " --instance-only")
+  except CatchableError as e:
+    operationFailure = "Unexpected export failure: " & e.msg
+  finally:
+    info("Restoring host-specific devices...")
+    var port = 0
+    try:
+      port = getPort(name)
+    except CatchableError as e:
+      let portErr = "Failed to read port allocation during device restoration: " & e.msg
+      restorationFailures.add(portErr)
+      error(portErr)
 
-  if exitCode != 0:
+    var restoreOrder: seq[string] = @[]
+    # Restore the parent ~/.config mount before its nested Herdr mount.
+    for device in HostDiskDeviceNames:
+      if device != HerdrDeviceName and device in originalDevices:
+        restoreOrder.add(device)
+    if HerdrDeviceName in originalDevices:
+      restoreOrder.add(HerdrDeviceName)
+    for device in proxyDevices:
+      if device in originalDevices:
+        restoreOrder.add(device)
+
+    for device in restoreOrder:
+      var restoreErr = ""
+      try:
+        restoreErr = restoreExportDevice(containerName, device, port)
+      except CatchableError as e:
+        restoreErr = fmt"Failed to restore device '{device}': {e.msg}"
+      if restoreErr.len > 0:
+        restorationFailures.add(restoreErr)
+        error(restoreErr)
+
+    # Legacy instances might not have had host-herdr before export. Never restart
+    # without validating or adding the isolated nested mount.
+    if ensureHerdrMount(containerName) != 0:
+      let herdrErr = "Failed to ensure isolated Herdr mount after export"
+      restorationFailures.add(herdrErr)
+      error(herdrErr)
+
+    if mayRestartAfterExport(wasRunning, restorationFailures.len):
+      info("Restarting container...")
+      try:
+        if execCmd("incus start " & quoteShell(containerName)) != 0:
+          restartFailure = fmt"Failed to restart container '{name}' after export restoration"
+      except CatchableError as e:
+        restartFailure = fmt"Failed to restart container '{name}' after export restoration: {e.msg}"
+      if restartFailure.len > 0:
+        error(restartFailure)
+    elif wasRunning and restorationFailures.len > 0:
+      restartFailure = fmt"Container '{name}' was left stopped because host-specific device restoration failed"
+      error(restartFailure)
+
+  var failed = false
+  if operationFailure.len > 0:
+    if not operationFailure.startsWith("Failed to remove device"):
+      error(operationFailure)
+    failed = true
+  elif exportExit != 0:
     error("Failed to export container")
+    failed = true
+  if restorationFailures.len > 0:
+    error(fmt"Failed to restore {restorationFailures.len} host-specific device(s)")
+    failed = true
+  if restartFailure.len > 0:
+    failed = true
+  if failed:
     return ord(ecError)
 
   success(fmt"Exported '{name}' to {outputPath}")
@@ -1100,12 +1457,16 @@ proc cmdImport*(name: string, file: string): int =
     error(fmt"File not found: {file}")
     return ord(ecError)
 
-  # Check container doesn't already exist
-  if containerExists(name):
+  let containerName = ContainerPrefix & name
+
+  # Confirm absence before resetting any preserved destination Herdr state.
+  let (destinationAbsent, destinationErr) = inspectInstanceAbsent(containerName)
+  if destinationErr.len > 0:
+    error(destinationErr)
+    return ord(ecError)
+  if not destinationAbsent:
     error("Container '" & name & "' already exists")
     return ord(ecError)
-
-  let containerName = ContainerPrefix & name
 
   # Ensure profile exists
   ensureProfile()
@@ -1116,33 +1477,48 @@ proc cmdImport*(name: string, file: string): int =
     error(portErr)
     return ord(ecError)
 
-  # Import container from backup tarball
-  info(fmt"Importing container from {file}...")
-  var exitCode = execCmd(fmt"incus import {quoteShell(file)} {containerName}")
-  if exitCode != 0:
-    error("Failed to import container from file")
+  let (_, herdrErr) = freshHerdrDirectory(containerName)
+  if herdrErr.len > 0:
+    error(herdrErr)
+    let cleanupErr = removeHerdrDirectory(containerName)
+    if cleanupErr.len > 0:
+      warn(cleanupErr)
     return ord(ecError)
 
   var cleanup = initCleanup(containerName)
 
-  # Reconfigure proxy devices with fresh ports (remove old, add new)
+  # Import container from backup tarball
+  info(fmt"Importing container from {file}...")
+  var exitCode = execCmd("incus import " & quoteShell(file) & " " & quoteShell(containerName))
+  if exitCode != 0:
+    error("Failed to import container from file")
+    cleanup.run()
+    return ord(ecError)
+
+  # Reconfigure proxy devices with fresh ports (remove old, add new).
+  # Any inherited-device removal failure is fatal; adding directly could hide it.
   info(fmt"Configuring ports (SSH: {port})...")
   exitCode = reconfigureProxyDevices(containerName, port)
   if exitCode != 0:
-    # If reconfigure fails, try adding directly (container may have no inherited devices)
-    exitCode = addProxyDevices(containerName, port)
-    if exitCode != 0:
-      cleanup.run()
-      return ord(ecError)
+    cleanup.run()
+    return ord(ecError)
 
   # Remove inherited disk mounts (source paths won't match on new host)
-  # and add fresh ones pointing to the current host's home directory
+  # and add fresh ones pointing to the current host's home directory.
   info("Configuring disk mounts...")
-  let diskDevices = @["host-config", "host-opencode", "host-claude", "host-codex", "host-omp", "host-ssh",
-                      "host-gitconfig", "host-oc-share", "host-oc-state"]
-  for device in diskDevices:
-    if deviceExists(containerName, device):
-      discard execCmd(fmt"incus config device remove {containerName} {device}")
+  let (importDeviceNames, inspectErr) = inspectDeviceNames(containerName)
+  if inspectErr.len > 0:
+    error(inspectErr)
+    cleanup.run()
+    return ord(ecError)
+  for device in HostDiskDeviceNames:
+    if device in importDeviceNames:
+      let removeExit = execCmd("incus config device remove " &
+        quoteShell(containerName) & " " & quoteShell(device))
+      if removeExit != 0:
+        error(fmt"Failed to remove inherited device '{device}'")
+        cleanup.run()
+        return ord(ecError)
 
   exitCode = addDiskMounts(containerName)
   if exitCode != 0:
@@ -1150,12 +1526,12 @@ proc cmdImport*(name: string, file: string): int =
     return ord(ecError)
 
   # Clear volatile config (MAC address, etc.) to avoid conflicts on new host
-  discard execCmd(fmt"incus config unset {containerName} volatile.eth0.hwaddr")
-  discard execCmd(fmt"incus config unset {containerName} volatile.eth0.host_name")
+  discard execCmd("incus config unset " & quoteShell(containerName) & " volatile.eth0.hwaddr")
+  discard execCmd("incus config unset " & quoteShell(containerName) & " volatile.eth0.host_name")
 
   # Start container
   info("Starting container...")
-  exitCode = execCmd(fmt"incus start {containerName}")
+  exitCode = execCmd("incus start " & quoteShell(containerName))
   if exitCode != 0:
     error("Failed to start container")
     cleanup.run()

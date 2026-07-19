@@ -10,7 +10,7 @@ This is especially useful when you need to run **complex projects requiring mult
 - **Non-root user** - Runs as `dev` user with matching UID, passwordless sudo available
 - **SSH access** - Unique port per container (starting at 2200, incrementing by 10)
 - **Service ports** - 10 additional forwarded ports per container for services (2300-2309, 2310-2319, etc.)
-- **Shared configs** - Automatically mounts `~/.config`, `~/.opencode`, `~/.claude`, `~/.codex`, `~/.omp`, `~/.ssh`, `~/.gitconfig`
+- **Shared configs** - Mounts common host configs while keeping Herdr state isolated per environment
 - **Docker-in-Docker** - Full Docker support via Incus nesting
 - **Low overhead** - ~100-200MB RAM per container vs 512MB+ for VMs
 - **Custom setup scripts** - Run post-create scripts to install additional tools
@@ -106,7 +106,7 @@ ocdev ports
 
 1. **Incus Profile**: Creates an `ocdev` profile with Docker nesting enabled
 2. **Container**: Launches Ubuntu 25.10 system container with the profile
-3. **Mounts**: Binds host directories into `/home/dev/` inside container
+3. **Mounts**: Binds host directories into `/home/dev/`; a nested mount isolates each environment's Herdr configuration
 4. **Provisioning**: Installs Docker, SSH server, git, curl
 5. **Port Forwarding**: Maps host ports to container ports:
    - SSH: host `22X0` -> container `22` (where X is 0, 1, 2, ... for each VM)
@@ -119,6 +119,7 @@ ocdev ports
 ~/.ocdev/                # Config directory
 ~/.ocdev/ports           # Port assignments (name:port format)
 ~/.ocdev/.lock           # Lock file for concurrent operations
+~/.local/share/ocdev/herdr/ocdev-<name>/  # Per-instance Herdr state (mode 0700)
 ```
 
 ## Port Allocation
@@ -200,6 +201,7 @@ sudo ufw status numbered
 | Host Path | Container Path | Mode |
 |-----------|----------------|------|
 | `~/.config` | `/home/dev/.config` | read-write |
+| `~/.local/share/ocdev/herdr/ocdev-<name>` | `/home/dev/.config/herdr` | read-write, per-instance |
 | `~/.opencode` | `/home/dev/.opencode` | read-write |
 | `~/.claude` | `/home/dev/.claude` | read-write |
 | `~/.codex` | `/home/dev/.codex` | read-write |
@@ -233,9 +235,16 @@ ocdev create myproject-clone --from myproject/initial
 In both forms, the cloned environment:
 - Gets new SSH and service port assignments (no port conflicts)
 - Does not inherit proxy devices or dynamic port bindings from the source
-- Keeps the same local host directory mounts as the source container
+- Keeps the shared host mounts, but starts with a fresh empty per-instance Herdr directory
 
 Use a live clone for fast local duplication, or a snapshot clone when you need a deliberate point-in-time base.
+
+## Export and Import
+
+Exports preserve the instance's original running state when restoration succeeds. If an instance is running, `ocdev` stops it before removing any host disk device (including the nested `host-herdr` mount), restores every device after the export attempt, and only then restarts it. Device removal failures abort the export; if restoration fails, the instance remains stopped so it cannot fall through to the shared Herdr directory. Restoration and restart failures are reported as errors, and export never deletes the existing per-instance Herdr directory.
+
+Imports create a fresh empty Herdr directory for the destination instance and attach it before the imported container starts. Any inherited-device removal failure aborts the import and cleanup preserves the Herdr directory whenever the imported instance could not be deleted or confirmed absent. Deleting an environment removes its per-instance Herdr directory only after Incus deletion succeeds.
+
 ## Custom Setup Scripts
 
 Run a custom script after container provisioning using `--post-create`:
