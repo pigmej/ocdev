@@ -52,7 +52,7 @@ proc readState(name: string): JsonNode =
       raise newException(ValueError, "Invalid state")
   except CatchableError: raise newException(IOError, "Invalid environment state")
 proc hasRecipeEnvironment*(name: string): bool = fileExists(statePath(name))
-proc locked(name: string; body: proc(): JsonNode {.closure.}): JsonNode =
+proc locked[T](name: string; body: proc(): T {.closure.}): T =
   validName(name)
   privateDir(root())
   privateDir(root() / "environments")
@@ -63,9 +63,10 @@ proc locked(name: string; body: proc(): JsonNode {.closure.}): JsonNode =
   if flock(fd, 2 or 4) != 0: raise newException(IOError, "Environment operation already running")
   defer: discard flock(fd, 8)
   body()
-proc backend(name: string): JsonNode =
+proc backend(name: string; cancelled: CancellationCheck = nil): JsonNode =
   # Filter before serializing: unrelated fleet metadata must not exhaust our cap.
-  let r = execute(@["incus", "list", "--format=json", "^" & ContainerPrefix & name & "$"], limit = 2 * 1024 * 1024)
+  let r = execute(@["incus", "list", "--format=json", "^" & ContainerPrefix & name & "$"],
+    limit = 2 * 1024 * 1024, cancelled = cancelled)
   if r.code != 0 or r.truncated: raise newException(IOError, "Incus instance query failed")
   try: result = parseJson(r.output)
   except CatchableError: raise newException(IOError, "Malformed Incus instance response")
@@ -81,17 +82,30 @@ proc query(path: string): JsonNode =
   try: result = parseJson(r.output)
   except CatchableError: raise newException(IOError, "Malformed Incus preflight response")
   if result.kind != JObject: raise newException(IOError, "Malformed Incus preflight response")
-proc observe(name: string): JsonNode =
-  for item in backend(name):
+proc observe(name: string; cancelled: CancellationCheck = nil): JsonNode =
+  for item in backend(name, cancelled):
     if item["name"].getStr == ContainerPrefix & name: return item
   newJNull()
-proc guard(state: JsonNode; running = true): JsonNode =
-  result = observe(state["name"].getStr)
+proc guard(state: JsonNode; running = true; cancelled: CancellationCheck = nil): JsonNode =
+  result = observe(state["name"].getStr, cancelled)
   if result.kind == JNull: raise newException(IOError, "Managed instance is missing")
   if state{"uuid"}.getStr == "" or result{"config", "volatile.uuid"}.getStr != state["uuid"].getStr:
     raise newException(IOError, "Instance identity does not match pinned environment")
   if running and result["status"].getStr.toLowerAscii != "running":
     raise newException(IOError, "Managed instance is not running")
+proc withRunningEnvironment*(name: string; body: proc(): int {.closure.};
+    cancelled: CancellationCheck = nil): int =
+  ## Ad-hoc execution shares lifecycle guards, but creates no task/run history.
+  locked(name, proc(): int =
+    if hasRecipeEnvironment(name):
+      discard guard(readState(name), cancelled = cancelled)
+    else:
+      let instance = observe(name, cancelled)
+      if instance.kind == JNull: raise newException(IOError, "Container not found")
+      if instance["status"].getStr.toLowerAscii != "running":
+        raise newException(IOError, "Container is not running; start it first")
+    body())
+
 proc hooks(state: JsonNode; hook: string): JsonNode =
   result = state{"recipe", "hooks", hook}
   if result.isNil: result = newJArray()

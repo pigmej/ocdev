@@ -83,8 +83,8 @@ same project-local Atlas dependencies as ocdev. Version regression tests also
 require Git and GNU Make; run them separately with `make test-version`.
 
 Use `make test-list-json` for listing contracts, `make test-create-config` for
-create defaults and `--fresh`, or `make test-recipes` for recipe
-coverage. Live container tests remain a separate, explicitly authorized workflow;
+create defaults and `--fresh`, `make test-exec` for direct command execution,
+or `make test-recipes` for recipe coverage. Live container tests remain a separate, explicitly authorized workflow;
 see [verification](docs/recipes.md#verification).
 
 ## Usage
@@ -130,6 +130,36 @@ ocdev delete myproject
 ocdev ports
 ```
 
+## Run a command
+
+`exec` runs a command as `dev` in an existing, running container. It defaults to
+`/home/dev`; use `--cwd` to select another absolute guest directory.
+
+```bash
+ocdev exec myproject -- uname -a
+ocdev exec myproject --cwd /home/dev/workspace/app -- npm test
+printf 'hello\n' | ocdev exec myproject -- cat
+ocdev exec myproject -- sh -c 'printf "%s\n" "$HOME"'
+```
+
+The `--` separator is required. Everything after it is passed literally to the
+program, including empty arguments, `--help`, and `--json`. There is no implicit
+shell or startup-file loading; invoke a shell explicitly when needed. `exec`
+has no ocdev-level `--json`: stdin, stdout, stderr, and the command's exit code
+pass through directly. Output is neither captured nor redacted by ocdev.
+
+There is no pseudo-terminal, automatic start, or execution timeout. Use
+`ocdev shell` for interactive sessions. Exec holds the environment lock until
+its Incus client exits, validates pinned UUIDs for recipe-managed containers,
+and does not create task/run history or command/output logs. `ex` is ambiguous
+with `export`; use `exec` explicitly.
+
+Ctrl+C/SIGTERM interrupts the local client; an unresponsive client is killed
+and reaped after a two-second grace period. Cancellation returns 130/143.
+**Client termination does not guarantee that a guest command has stopped**;
+check the guest before retrying a command with side effects. Signal forwarding
+and local cleanup are covered by fake-backend tests, not live Incus verification.
+
 ## Recipes and projects
 
 Recipes clone an **existing** `container/snapshot`, then deliver project files and run declared tasks/hooks. There is no new image builder, snapshot manager, or server.
@@ -155,6 +185,7 @@ See **[Recipes and projects](docs/recipes.md)** for the schema, complete CLI, ge
 | `ocdev start <name>` | Start a stopped environment |
 | `ocdev stop <name>` | Stop a running environment |
 | `ocdev shell <name>` | Get interactive shell inside |
+| `ocdev exec <name> [--cwd <path>] -- <command> [args...]` | Run a command with raw stdin/stdout/stderr and exit status |
 | `ocdev ssh <name>` | Show SSH connection info |
 | `ocdev delete <name>` | Remove environment |
 | `ocdev ports` | Show all port mappings |

@@ -11,7 +11,7 @@ type
     code*: int
     output*, error*: string
   Child* = ref object
-    pid: Pid
+    pid*: Pid
     directory: string
     finished: bool
   Sandbox* = ref object
@@ -92,7 +92,7 @@ proc start*(s: Sandbox; binary: string; args: seq[string]): Child =
   result.pid = pid
   s.children.add(result)
 
-proc reap(child: Child; killFirst: bool; timeoutMs: int): RunResult =
+proc reap(child: Child; killFirst: bool; timeoutMs: int; cleanupGroup = true): RunResult =
   doAssert not child.finished, "Child already collected"
   var status: cint
   var timedOut = killFirst
@@ -112,7 +112,7 @@ proc reap(child: Child; killFirst: bool; timeoutMs: int): RunResult =
       discard kill(child.pid, SIGKILL)
     sleep(5)
   # Fixtures must not leave descendants behind after the command exits.
-  discard killpg(child.pid, SIGKILL)
+  if cleanupGroup: discard killpg(child.pid, SIGKILL)
   child.finished = true
   result.code = if timedOut: 124
                 elif WIFEXITED(status): int(WEXITSTATUS(status))
@@ -123,7 +123,10 @@ proc reap(child: Child; killFirst: bool; timeoutMs: int): RunResult =
   if timedOut and not killFirst:
     raise newException(TestProcessTimeout, "Test subprocess exceeded its deadline")
 
-proc finish*(child: Child; timeoutMs = 20000): RunResult = reap(child, false, timeoutMs)
+proc finish*(child: Child; timeoutMs = 20000; cleanupGroup = true): RunResult =
+  ## Disable group cleanup only when a test verifies reaping itself and supplies
+  ## its own finally cleanup; otherwise this would conceal leaked descendants.
+  reap(child, false, timeoutMs, cleanupGroup)
 proc run*(s: Sandbox; binary: string; args: seq[string]; timeoutMs = 20000): RunResult =
   finish(start(s, binary, args), timeoutMs)
 

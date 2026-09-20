@@ -17,14 +17,19 @@ clCfg.useMulti = """${doc}Usage:
 
 Subcommands:
 $subcmds
+Ad-hoc commands: ocdev exec NAME [--cwd PATH] -- COMMAND [ARGS...]
 Recipe commands: recipe, project, inspect, setup, task, runs, services, doctor
 Create also accepts --recipe FILE-OR-ID or --project FILE (existing snapshots).
-Noninteractive commands accept --json. Run "ocdev recipe --help" for the full workflow.
+Noninteractive commands accept --json except exec, which passes through command I/O.
+Run "ocdev recipe --help" for the full workflow.
 Run "$command SUBCMD --help" for details on a specific command.${ifVersion}"""
 
 when isMainModule:
+  # Nim quit(int) saturates POSIX codes above 127. Preserve the full exit byte
+  # for executed commands and conventional signal statuses (130, 143, ...).
+  proc exitWithStatus(code: cint) {.importc: "exit", header: "<stdlib.h>", noreturn.}
   let extended = dispatchExtended(commandLineParams())
-  if extended.handled: quit(extended.code)
+  if extended.handled: exitWithStatus(cint(extended.code))
   const noVer = "CLIGEN-NOHELP" # Hide --version from subcommand help tables
 
   dispatchMulti(

@@ -1,7 +1,7 @@
 ## CLI-only orchestration. Human output and JSON share the same operations.
 import std/[os, json, strutils, tables, sequtils]
 import cligen/parseopt3
-import config, commands, ports, automation, recipes, recipe_engine, safe_input
+import config, commands, ports, automation, recipes, recipe_engine, safe_input, exec_cli
 
 type
   Options = object
@@ -298,7 +298,9 @@ const ExtendedHelp = """Recipe and automation commands:
   ocdev services list|start|stop|restart|logs <name> [service] [--tail N] [--json]
   ocdev doctor [--json]
   ocdev delete <name> [--dry-run] [--json]
-Noninteractive legacy commands also accept --json. shell is interactive only.
+Noninteractive legacy commands also accept --json, except exec (raw command I/O).
+  ocdev exec <name> [--cwd <absolute-path>] -- <command> [args...]
+shell is interactive only.
 Recipes are trusted code and clone an existing container/snapshot.
 """
 
@@ -316,15 +318,21 @@ proc dispatchExtended*(args: seq[string]): tuple[handled: bool, code: int] =
     return (true, 1)
   let groups = ["recipe", "project", "inspect", "setup", "task", "runs", "services", "doctor"]
   let legacy = ["create", "list", "start", "stop", "shell", "ssh", "delete", "ports",
-    "bind", "unbind", "rebind", "bindings", "export", "import"]
+    "bind", "unbind", "rebind", "bindings", "exec", "export", "import"]
   let normalized = optionNormalize(args[0])
   let matches = legacy.filterIt(it.startsWith(normalized))
+  if matches.len > 1 and "exec" in matches:
+    stderr.writeLine("Error: ambiguous command; use exec or export")
+    return (true, 1)
   let command = if normalized in legacy or normalized in groups: normalized
                 elif matches.len == 1: matches[0] else: args[0]
   # Canonicalize every spelling accepted by the legacy dispatch before routing;
   # otherwise abbreviations (sto/del) could bypass recipe hooks and locks.
   if command != args[0]:
     return dispatchExtended(@[command] & args[1 .. ^1])
+  # Exec owns its delimiter and raw I/O contract. In particular, guest --help
+  # and --json must not enter the ordinary CLI option scanning below.
+  if command == "exec": return dispatchExec(args[1 .. ^1])
   if command == "list": return (false, 0) # Preserve the exact original contract.
   if "--help" in args and command notin groups: return (false, 0)
   let jsonMode = "--json" in args
