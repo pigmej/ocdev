@@ -37,7 +37,7 @@ proc withExecSignals*(body: proc(): int {.closure.}): int =
 proc exitImmediately(code: cint) {.importc: "_exit", header: "<unistd.h>", noreturn.}
 
 proc streamExec*(args: seq[string]): int =
-  ## Keep ocdev alive to own the environment lock until the Incus client is reaped.
+  ## Keep ocdev alive to forward cancellation and reap the Incus client.
   ## The client shares our foreground group, allowing terminal stdin without a PTY.
   if interrupted(): return 128 + int(receivedSignal)
   if args.len == 0: raise newException(ValueError, "Missing executable")
