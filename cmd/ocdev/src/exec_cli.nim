@@ -9,6 +9,7 @@ Run a command as dev in an existing, running container (default cwd: /home/dev).
 Forward stdin, stdout, stderr and exit status directly, without a pseudo-terminal.
 Everything after -- belongs to the command, including --help and --json.
 No implicit shell, startup files, timeout, or command/output history.
+Concurrent exec sessions are allowed; execution does not hold a lifecycle lock.
 Use ocdev shell for an interactive terminal, or explicitly run sh -c for shell syntax.
 """
 
@@ -51,7 +52,8 @@ proc dispatchExec*(args: seq[string]): tuple[handled: bool, code: int] =
     let invocation = @["incus", "exec", ContainerPrefix & name,
       "--mode=non-interactive", "--cwd", cwd, "--", "runuser", "-u", "dev", "--"] & command
     result.code = withExecSignals(proc(): int =
-      withRunningEnvironment(name, proc(): int = streamExec(invocation), interrupted))
+      checkRunningEnvironment(name, interrupted)
+      streamExec(invocation))
   except CatchableError as error:
     stderr.writeLine("Error: " & error.msg)
     result.code = 1

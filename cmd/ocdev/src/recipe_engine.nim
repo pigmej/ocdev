@@ -93,18 +93,17 @@ proc guard(state: JsonNode; running = true; cancelled: CancellationCheck = nil):
     raise newException(IOError, "Instance identity does not match pinned environment")
   if running and result["status"].getStr.toLowerAscii != "running":
     raise newException(IOError, "Managed instance is not running")
-proc withRunningEnvironment*(name: string; body: proc(): int {.closure.};
-    cancelled: CancellationCheck = nil): int =
-  ## Ad-hoc execution shares lifecycle guards, but creates no task/run history.
-  locked(name, proc(): int =
-    if hasRecipeEnvironment(name):
-      discard guard(readState(name), cancelled = cancelled)
-    else:
-      let instance = observe(name, cancelled)
-      if instance.kind == JNull: raise newException(IOError, "Container not found")
-      if instance["status"].getStr.toLowerAscii != "running":
-        raise newException(IOError, "Container is not running; start it first")
-    body())
+proc checkRunningEnvironment*(name: string; cancelled: CancellationCheck = nil) =
+  ## Point-in-time preflight only: exec does not coordinate with lifecycle locks.
+  ## The instance can stop or change between this check and execution by name.
+  validName(name)
+  if hasRecipeEnvironment(name):
+    discard guard(readState(name), cancelled = cancelled)
+  else:
+    let instance = observe(name, cancelled)
+    if instance.kind == JNull: raise newException(IOError, "Container not found")
+    if instance["status"].getStr.toLowerAscii != "running":
+      raise newException(IOError, "Container is not running; start it first")
 
 proc hooks(state: JsonNode; hook: string): JsonNode =
   result = state{"recipe", "hooks", hook}

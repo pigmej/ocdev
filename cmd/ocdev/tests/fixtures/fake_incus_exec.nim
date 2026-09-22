@@ -20,16 +20,17 @@ proc main() =
     return
   let home = getEnv("HOME")
   let settings = parseJson(readFile(home / "fixture.json"))
-  proc barrier(kind: string) =
+  proc barrier(kind: string; id = "") =
+    let suffix = if id.len == 0: "" else: "-" & id
     signal(SIGINT, onSignal)
     signal(SIGTERM, onSignal)
-    writeFile(home / "incus.pid", $getCurrentProcessId())
-    writeFile(home / (kind & "-ready"), "ready")
+    writeFile(home / ("incus.pid" & suffix), $getCurrentProcessId())
+    writeFile(home / (kind & "-ready" & suffix), "ready")
     for attempt in 0 ..< 3000:
       if received != 0:
-        writeFile(home / "signal", $received)
+        writeFile(home / ("signal" & suffix), $received)
         if not settings{"ignoreSignals"}.getBool: exitWithStatus(128 + received)
-      if fileExists(home / "release"): return
+      if fileExists(home / ("release" & suffix)): return
       sleep(5)
     quit(98)
   let log = open(home / "calls", fmAppend)
@@ -70,7 +71,7 @@ proc main() =
     signal(sig, SIG_DFL)
     discard kill(Pid(getCurrentProcessId()), sig)
     quit(99)
-  of "block": barrier("exec")
+  of "block": barrier("exec", if guest.len > 1: guest[1] else: "")
   else: quit("Unsupported fake guest command", 99)
 
 main()

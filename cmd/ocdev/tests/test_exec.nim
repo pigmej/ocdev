@@ -37,9 +37,6 @@ proc noHistory(s: Sandbox) =
       for path in walkDirRec(directory):
         checkpoint("Unexpected exec history/log file: " & path)
         check false
-proc lockAvailable(s: Sandbox) =
-  let fd = acquireLock(s.lockPath)
-  releaseLock(fd)
 
 suite "Direct exec CLI":
   setup:
@@ -74,6 +71,50 @@ suite "Direct exec CLI":
     check equalsCwd.output == ""
     check equalsCwd.error == ""
     s.noHistory()
+
+  test "plain exec does not initialize local state":
+    let r = s.run(binary, @["exec", "demo", "--", "literal"])
+    check r.code == 0
+    check not dirExists(s.home / ".ocdev")
+
+  test "concurrent exec sessions exit independently":
+    for recipe in [false, true]:
+      if recipe: s.managed()
+      for cancelFirst in [false, true]:
+        let first = s.start(binary, @["exec", "demo", "--", "block", "first"])
+        let second = s.start(binary, @["exec", "demo", "--", "block", "second"])
+        try:
+          if not waitFor(s.home / "exec-ready-first") or
+              not waitFor(s.home / "exec-ready-second"):
+            raise newException(IOError, "Concurrent clients did not reach execution barriers")
+          let firstPid = Pid(parseInt(readFile(s.home / "incus.pid-first")))
+          let secondPid = Pid(parseInt(readFile(s.home / "incus.pid-second")))
+          check firstPid != secondPid
+          if cancelFirst: check kill(first.pid, SIGTERM) == 0
+          else: writeFile(s.home / "release-first", "go")
+          let a = first.finish(7000, cleanupGroup = false)
+          check a.code == (if cancelFirst: 143 else: 0)
+          check a.output == ""
+          check a.error == ""
+          check kill(firstPid, 0) == -1
+          check errno == ESRCH
+          check kill(second.pid, 0) == 0
+          check kill(secondPid, 0) == 0
+          writeFile(s.home / "release-second", "go")
+          let b = second.finish(7000, cleanupGroup = false)
+          check b.code == 0
+          check b.output == ""
+          check b.error == ""
+          check kill(secondPid, 0) == -1
+          check errno == ESRCH
+          check not fileExists(s.lockPath)
+          if not recipe: check not dirExists(s.home / ".ocdev")
+          s.noHistory()
+        finally:
+          discard killpg(first.pid, SIGKILL)
+          discard killpg(second.pid, SIGKILL)
+        for marker in ["exec-ready-first", "exec-ready-second", "release-first", "release-second"]:
+          if fileExists(s.home / marker): removeFile(s.home / marker)
 
   test "large separate binary streams are byte exact":
     let r = s.run(binary, @["exec", "demo", "--", "streams"])
@@ -143,12 +184,16 @@ suite "Direct exec CLI":
       s.rejected(@["exec", "demo", "--", "literal"])
     s.noHistory()
 
-  test "plain and recipe environments honor held locks":
+  test "plain and recipe exec ignore held lifecycle locks":
     createDir(s.home / ".ocdev/environments")
     for recipe in [false, true]:
       if recipe: s.managed()
       let fd = acquireLock(s.lockPath)
-      try: s.rejected(@["exec", "demo", "--", "literal"])
+      try:
+        let r = s.run(binary, @["exec", "demo", "--", "literal"])
+        check r.code == 0
+        check r.output == ""
+        check r.error == ""
       finally: releaseLock(fd)
     s.noHistory()
 
@@ -164,7 +209,7 @@ suite "Direct exec CLI":
     check r.error == ""
     s.noHistory()
 
-  test "lock spans guest lifetime and releases without history changes":
+  test "running exec permits exclusive lifecycle locks without history changes":
     for recipe in [false, true]:
       if recipe: s.managed()
       createDir(s.home / ".ocdev/runs/logs")
@@ -175,12 +220,11 @@ suite "Direct exec CLI":
       let child = s.start(binary, @["exec", "demo", "--", "block"])
       if not waitFor(s.home / "exec-ready"):
         raise newException(IOError, "Execution did not reach fixture barrier")
-      expect IOError:
-        let fd = acquireLock(s.lockPath)
-        releaseLock(fd)
+      createDir(s.home / ".ocdev/environments")
+      let fd = acquireLock(s.lockPath)
+      releaseLock(fd)
       writeFile(s.home / "release", "go")
       check child.finish().code == 0
-      s.lockAvailable()
       check readFile(history) == "unchanged-history"
       check readFile(log) == "unchanged-log"
       removeFile(history)
@@ -220,7 +264,7 @@ suite "Direct exec CLI":
         check r.error == ""
         check kill(incusPid, 0) == -1
         check errno == ESRCH
-        s.lockAvailable()
+        check not dirExists(s.home / ".ocdev")
         s.noHistory()
       finally:
         discard killpg(child.pid, SIGKILL)
@@ -251,7 +295,7 @@ suite "Direct exec CLI":
             check r.error == ""
             check kill(incusPid, 0) == -1
             check errno == ESRCH
-            s.lockAvailable()
+            check not dirExists(s.home / ".ocdev")
             s.noHistory()
           finally:
             discard killpg(child.pid, SIGKILL)

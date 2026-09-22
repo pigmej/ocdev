@@ -149,10 +149,14 @@ has no ocdev-level `--json`: stdin, stdout, stderr, and the command's exit code
 pass through directly. Output is neither captured nor redacted by ocdev.
 
 There is no pseudo-terminal, automatic start, or execution timeout. Use
-`ocdev shell` for interactive sessions. Exec holds the environment lock until
-its Incus client exits, validates pinned UUIDs for recipe-managed containers,
-and does not create task/run history or command/output logs. `ex` is ambiguous
-with `export`; use `exec` explicitly.
+`ocdev shell` for interactive sessions. Multiple exec sessions can run concurrently
+in the same container. Exec does not acquire an environment lock or block lifecycle
+operations, and it does not create task/run history or command/output logs.
+It checks running state and, for recipe-managed containers, the pinned UUID before
+execution. These are point-in-time checks: a container can stop or be replaced
+between preflight and execution by name. Stop/delete can interrupt running commands;
+exec does not coordinate with setup or teardown. `ex` is ambiguous with `export`;
+use `exec` explicitly.
 
 Ctrl+C/SIGTERM interrupts the local client; an unresponsive client is killed
 and reaped after a two-second grace period. Cancellation returns 130/143.
